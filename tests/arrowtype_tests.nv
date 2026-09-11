@@ -1,0 +1,271 @@
+// arrowtype_tests.nv — the two tables the columnar specification is,
+// asserted one type at a time.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: arrow-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE ENTRIES A HAND-WRITTEN READER GETS WRONG.  A suite
+// that asserted `Int64` has two buffers would prove nothing: everybody
+// gets `Int64` right.  What follows is `Null` (no buffers at all),
+// `Bool` (bits, not bytes), `Struct` (validity only — no values
+// buffer), `FixedSizeList` (no offsets — the width is in the type) and
+// both unions (no VALIDITY — a union's nulls live in its children).
+// Those six are the whole difference between a reader that works on
+// somebody else's file and one that works on its own.
+
+use std.test
+use std.list
+use arrowtype
+use arrowbuf
+
+@test
+fn test_the_buffer_count_table_is_the_columnar_specification() [io]
+    test.case("Null has no buffers at all — a length and nothing else")
+    test.assert(arrowtype.buffer_count_of(ArrowNull) == 0)
+
+    test.case("Bool has validity and a BITMAP of values, which is still two")
+    test.assert(arrowtype.buffer_count_of(ArrowBool) == 2)
+
+    test.case("a fixed-width primitive has validity and values")
+    test.assert(arrowtype.buffer_count_of(ArrowInt64) == 2)
+    test.assert(arrowtype.buffer_count_of(ArrowFloat64) == 2)
+    test.assert(arrowtype.buffer_count_of(ArrowDate32) == 2)
+    test.assert(arrowtype.buffer_count_of(ArrowFixedSizeBinary(16)) == 2)
+
+    test.case("a variable-width primitive adds offsets — three")
+    test.assert(arrowtype.buffer_count_of(ArrowUtf8) == 3)
+    test.assert(arrowtype.buffer_count_of(ArrowBinary) == 3)
+    test.assert(arrowtype.buffer_count_of(ArrowLargeUtf8) == 3)
+
+    test.case("a list has validity and offsets and NO values — the values are the child")
+    test.assert(arrowtype.buffer_count_of(ArrowList) == 2)
+    test.assert(arrowtype.buffer_count_of(ArrowLargeList) == 2)
+    test.assert(arrowtype.buffer_count_of(ArrowMap(false)) == 2)
+
+    test.case("a fixed-size list has no offsets — the width is in the type")
+    test.assert(arrowtype.buffer_count_of(ArrowFixedSizeList(3)) == 1)
+
+    test.case("a struct has validity only")
+    test.assert(arrowtype.buffer_count_of(ArrowStruct) == 1)
+
+    test.case("a sparse union has type ids and NO validity")
+    test.assert(arrowtype.buffer_count_of(ArrowUnion(ArrowSparseUnion)) == 1)
+
+    test.case("a dense union adds the per-element offset into its child")
+    test.assert(arrowtype.buffer_count_of(ArrowUnion(ArrowDenseUnion)) == 2)
+
+@test
+fn test_a_union_carries_no_validity_bitmap_and_that_is_the_off_by_one() [io]
+    test.case("every ordinary type has one")
+    test.assert(arrowtype.has_validity(ArrowInt32))
+    test.assert(arrowtype.has_validity(ArrowUtf8))
+    test.assert(arrowtype.has_validity(ArrowStruct))
+
+    test.case("Null does not — there is nothing to mark present")
+    test.assert(arrowtype.has_validity(ArrowNull) == false)
+
+    test.case("and neither union does: a null in a union is a null in its child")
+    test.assert(arrowtype.has_validity(ArrowUnion(ArrowSparseUnion)) == false)
+    test.assert(arrowtype.has_validity(ArrowUnion(ArrowDenseUnion)) == false)
+
+@test
+fn test_the_role_of_each_buffer_is_a_function_of_the_type() [io]
+    test.case("Utf8 is validity, 32-bit offsets, values")
+    let u = arrowbuf.layout_of(ArrowUtf8)
+    test.assert(list.len(u) == 3)
+    match u[0]
+        ArrowValidityRole => test.assert(true)
+        _                 => test.assert(false)
+    match u[1]
+        ArrowOffset32Role => test.assert(true)
+        _                 => test.assert(false)
+    match u[2]
+        ArrowValuesRole => test.assert(true)
+        _               => test.assert(false)
+
+    test.case("LargeUtf8 differs from Utf8 only in the offsets' width")
+    let lu = arrowbuf.layout_of(ArrowLargeUtf8)
+    match lu[1]
+        ArrowOffset64Role => test.assert(true)
+        _                 => test.assert(false)
+
+    test.case("Bool's second buffer is BITS, not VALUES — the name says which")
+    let b = arrowbuf.layout_of(ArrowBool)
+    match b[1]
+        ArrowBitsRole => test.assert(true)
+        _             => test.assert(false)
+
+    test.case("a dense union is type ids then offsets, with no validity first")
+    let d = arrowbuf.layout_of(ArrowUnion(ArrowDenseUnion))
+    test.assert(list.len(d) == 2)
+    match d[0]
+        ArrowTypeIdRole => test.assert(true)
+        _               => test.assert(false)
+    match d[1]
+        ArrowUnionOffsetRole => test.assert(true)
+        _                    => test.assert(false)
+
+    test.case("Null has no buffers, so the layout is empty")
+    test.assert(list.len(arrowbuf.layout_of(ArrowNull)) == 0)
+
+@test
+fn test_the_child_count_table() [io]
+    test.case("a primitive has none")
+    test.assert(arrowtype.child_count_of(ArrowInt8) == 0)
+    test.assert(arrowtype.child_count_of(ArrowUtf8) == 0)
+
+    test.case("every list shape has exactly one")
+    test.assert(arrowtype.child_count_of(ArrowList) == 1)
+    test.assert(arrowtype.child_count_of(ArrowLargeList) == 1)
+    test.assert(arrowtype.child_count_of(ArrowFixedSizeList(4)) == 1)
+
+    test.case("a map has ONE child too — the entries struct, not two")
+    test.assert(arrowtype.child_count_of(ArrowMap(false)) == 1)
+
+    test.case("a struct and both unions have any number, spelled -1")
+    test.assert(arrowtype.child_count_of(ArrowStruct) == 0 - 1)
+    test.assert(arrowtype.child_count_of(ArrowUnion(ArrowSparseUnion)) == 0 - 1)
+
+@test
+fn test_the_width_of_a_bool_is_one_bit_and_that_is_why_it_is_in_bits() [io]
+    test.case("Bool is one BIT")
+    test.assert(arrowtype.fixed_width_bits(ArrowBool) == 1)
+
+    test.case("the integers are their names")
+    test.assert(arrowtype.fixed_width_bits(ArrowInt8) == 8)
+    test.assert(arrowtype.fixed_width_bits(ArrowInt16) == 16)
+    test.assert(arrowtype.fixed_width_bits(ArrowInt32) == 32)
+    test.assert(arrowtype.fixed_width_bits(ArrowInt64) == 64)
+
+    test.case("Float16 is two bytes even though novo-lang has no f16")
+    test.assert(arrowtype.fixed_width_bits(ArrowFloat16) == 16)
+
+    test.case("Date32 is 32 and Date64 is 64, and the units differ")
+    test.assert(arrowtype.fixed_width_bits(ArrowDate32) == 32)
+    test.assert(arrowtype.fixed_width_bits(ArrowDate64) == 64)
+
+    test.case("a decimal is 128 or 256 bits whatever its precision")
+    test.assert(arrowtype.fixed_width_bits(ArrowDecimal128(38, 10)) == 128)
+    test.assert(arrowtype.fixed_width_bits(ArrowDecimal256(76, 20)) == 256)
+
+    test.case("FixedSizeBinary is its width in BYTES, answered in bits")
+    test.assert(arrowtype.fixed_width_bits(ArrowFixedSizeBinary(16)) == 128)
+
+    test.case("a variable-width type answers zero")
+    test.assert(arrowtype.fixed_width_bits(ArrowUtf8) == 0)
+    test.assert(arrowtype.fixed_width_bits(ArrowList) == 0)
+
+@test
+fn test_an_empty_timestamp_zone_is_not_utc() [io]
+    test.case("two timestamps with different zones are different types")
+    test.assert(arrowtype.type_eq(ArrowTimestamp(ArrowMicro, ""),
+                                  ArrowTimestamp(ArrowMicro, "UTC")) == false)
+
+    test.case("and two with different units are too")
+    test.assert(arrowtype.type_eq(ArrowTimestamp(ArrowMicro, "UTC"),
+                                  ArrowTimestamp(ArrowNano, "UTC")) == false)
+
+    test.case("the same type is the same type")
+    test.assert(arrowtype.type_eq(ArrowTimestamp(ArrowMicro, "Europe/Oslo"),
+                                  ArrowTimestamp(ArrowMicro, "Europe/Oslo")))
+
+    test.case("a decimal's precision and scale are part of its identity")
+    test.assert(arrowtype.type_eq(ArrowDecimal128(38, 10),
+                                  ArrowDecimal128(38, 2)) == false)
+
+@test
+fn test_a_time32_in_microseconds_is_refused_by_the_type_check() [io]
+    test.case("Time32 takes seconds or milliseconds")
+    test.assert(list.len(arrowtype.check_type(ArrowTime32(ArrowSecond))) == 0)
+    test.assert(list.len(arrowtype.check_type(ArrowTime32(ArrowMilli))) == 0)
+
+    test.case("and refuses the two that do not fit in 32 bits of a day")
+    test.assert(list.len(arrowtype.check_type(ArrowTime32(ArrowMicro))) > 0)
+    test.assert(list.len(arrowtype.check_type(ArrowTime32(ArrowNano))) > 0)
+
+    test.case("Time64 is the other two")
+    test.assert(list.len(arrowtype.check_type(ArrowTime64(ArrowMicro))) == 0)
+    test.assert(list.len(arrowtype.check_type(ArrowTime64(ArrowSecond))) > 0)
+
+    test.case("a Decimal128 cannot carry 40 digits")
+    test.assert(list.len(arrowtype.check_type(ArrowDecimal128(40, 2))) > 0)
+
+    test.case("and a scale past the precision is not a decimal")
+    test.assert(list.len(arrowtype.check_type(ArrowDecimal128(10, 12))) > 0)
+
+    test.case("a FixedSizeBinary of width zero is not a type")
+    test.assert(list.len(arrowtype.check_type(ArrowFixedSizeBinary(0))) > 0)
+
+@test
+fn test_a_dictionary_is_a_property_of_the_field_not_of_the_type() [io]
+    let f = arrowtype.dict_field("city", ArrowUtf8, ArrowInt32, 7, false, true)
+
+    test.case("the field's data type is the VALUES' type")
+    test.assert(arrowtype.type_eq(f.data_type, ArrowUtf8))
+
+    test.case("and the index type is on the dictionary")
+    match f.dictionary
+        Some(d) =>
+            test.assert(arrowtype.type_eq(d.index_type, ArrowInt32))
+            test.assert(d.id == 7)
+        None    => test.assert(false)
+
+    test.case("an index type must be an integer")
+    test.assert(arrowtype.is_index_type(ArrowInt32))
+    test.assert(arrowtype.is_index_type(ArrowUInt8))
+    test.assert(arrowtype.is_index_type(ArrowUtf8) == false)
+    test.assert(arrowtype.is_index_type(ArrowFloat64) == false)
+
+@test
+fn test_a_map_whose_child_is_not_the_entries_struct_is_refused() [io]
+    test.case("the entries struct this package builds passes")
+    let entries = arrowtype.map_entries(ArrowUtf8, ArrowInt64, true)
+    let good = arrowtype.nested_field("m", ArrowMap(false), true, [entries])
+    test.assert(list.len(arrowtype.check_field(good)) == 0)
+
+    test.case("a map with two children is not a map")
+    let bad_children = arrowtype.nested_field("m", ArrowMap(false), true,
+        [arrowtype.field("k", ArrowUtf8, false),
+         arrowtype.field("v", ArrowInt64, true)])
+    test.assert(list.len(arrowtype.check_field(bad_children)) > 0)
+
+    test.case("and a map whose single child is not a struct is not one either")
+    let bad_kind = arrowtype.nested_field("m", ArrowMap(false), true,
+        [arrowtype.field("entries", ArrowUtf8, false)])
+    test.assert(list.len(arrowtype.check_field(bad_kind)) > 0)
+
+@test
+fn test_duplicate_field_names_are_reported_because_every_consumer_breaks_on_them() [io]
+    let s = arrowtype.schema([arrowtype.field("id", ArrowInt64, false),
+                              arrowtype.field("id", ArrowUtf8, true)])
+
+    test.case("the format permits them and this check does not")
+    test.assert(list.len(arrowtype.check_schema(s)) > 0)
+    test.assert(arrowtype.schema_ok(s) == false)
+
+    test.case("and field_index answers the FIRST, which is the reason to check")
+    test.assert(arrowtype.field_index(s, "id") == 0)
+
+    test.case("a name that is not there answers -1 rather than a fault")
+    test.assert(arrowtype.field_index(s, "missing") == 0 - 1)
+
+@test
+fn test_the_walk_counts_are_the_sum_over_a_pre_order_walk() [io]
+    // struct { a: Int64, b: List<Utf8> }
+    let inner = arrowtype.field("item", ArrowUtf8, true)
+    let b = arrowtype.nested_field("b", ArrowList, true, [inner])
+    let a = arrowtype.field("a", ArrowInt64, false)
+    let s = arrowtype.schema([a, b])
+
+    test.case("three nodes: a, b, and b's child")
+    test.assert(arrowtype.node_count_of(s) == 3)
+
+    test.case("and 2 + 2 + 3 buffers over the same walk")
+    test.assert(arrowtype.buffer_count_of_schema(s) == 7)
+
+    test.case("the paths are dotted from the root, in the same order")
+    let paths = arrowtype.field_paths(s)
+    test.assert(list.len(paths) == 3)
+    test.assert(paths[0] == "a")
+    test.assert(paths[1] == "b")
+    test.assert(paths[2] == "b.item")

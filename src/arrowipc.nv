@@ -1,0 +1,333 @@
+// arrowipc.nv — the IPC stream and file formats, read: the framing, the
+// message envelope, and a feed-and-drain reader that never holds a
+// batch it has not been asked for.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// TWO FORMATS, ONE BODY OF WORK.  The STREAM format is a sequence of
+// encapsulated messages ending with a zero-length one; the FILE format
+// is the same sequence with `ARROW1\0\0` at both ends and a footer
+// before the trailing magic that indexes every message by byte offset.
+// So a stream reader reads a file's middle, and a file reader is a
+// stream reader plus a footer — which is why `ArrowIpcReader` handles
+// both and `ArrowIpcMode` is a constructor argument rather than two
+// types.
+//
+// AN ENCAPSULATED MESSAGE IS FOUR PARTS AND THE FIRST ONE IS A TRAP:
+//
+//     0xFFFFFFFF          the continuation marker, little-endian
+//     int32               the metadata length, padded to 8
+//     <metadata>          a FlatBuffers `Message`
+//     <body>              the buffers, contiguous, at the offsets the
+//                         metadata's `buffers` list gives
+//
+// The continuation marker was added in Arrow 0.15 and older writers
+// omit it, so a reader that assumed it reads the metadata length as the
+// marker and the metadata as the length.  `ArrowBadContinuation` names
+// it, and `with_legacy` accepts the pre-0.15 framing for a caller
+// reading an archive — off by default, because silently accepting both
+// is how a corrupt stream gets read as a legacy one.
+//
+// **THE READER IS FEED-AND-DRAIN OVER EVENTS, NOT OVER BATCHES.**  A
+// record batch can be larger than memory and a stream is a sequence of
+// them, so `feed` answers EVENTS — schema seen, dictionary seen, batch
+// seen, stream ended — and the batch an event carries is a tree of
+// spans into a body the caller still owns.  Nothing here copies a
+// buffer, and the reader's own state is bounded by the SCHEMA's size
+// rather than by the data's.
+//
+// THE CALLER SIZES THE LIMIT, BEFORE ANYTHING IS ALLOCATED.  A message
+// header can claim a metadata length of two gigabytes.  `with_limit`
+// is the number that crosses the interface first, and a message past it
+// is `ArrowMessageTooLarge` carrying both numbers — the same shape
+// zstd-nv's window limit takes, and for the same reason.
+
+// Which of the two formats a reader is reading.
+pub enum ArrowIpcMode
+    // A bare sequence of messages, ending with a zero-length one.  What
+    // travels over a socket.
+    ArrowStreamFormat
+    // The same with `ARROW1\0\0` at both ends and a footer.  Seekable:
+    // a reader that can seek reads the footer first and then only the
+    // batches a projection needs.
+    ArrowFileFormat
+
+// What the reader produced from the bytes it was fed.
+//
+// **THE ACTION ENUM OF THIS PACKAGE.**  Every one of these is something
+// the HOST must then decide about, and the reader decides none of it:
+// it does not open the next file, it does not resolve the schema
+// against a table definition, it does not choose whether a batch is
+// worth materialising.
+pub enum ArrowIpcEvent
+    // The schema message.  Exactly one per stream, first.
+    ArrowSchemaSeen(schema: ArrowSchema)
+    // A dictionary batch, with the id it installs and whether it
+    // replaces or appends.
+    ArrowDictionarySeen(id: Int, values: ArrowArray, is_delta: Bool, body_at: Int, body_len: Int)
+    // A record batch, as spans into the body at `body_at`.
+    ArrowBatchSeen(batch: ArrowBatch, body_at: Int, body_len: Int)
+    // The zero-length message that ends a stream, or the trailing magic
+    // that ends a file.
+    ArrowStreamEnded
+    // A message kind this package does not read — the two tensor kinds.
+    // An EVENT rather than a fault, because skipping one is correct:
+    // the metadata gives its body length, so a reader steps over a
+    // tensor and keeps reading the record batches after it.
+    ArrowMessageSkipped(kind: Str, body_len: Int)
+
+// What one `feed` produced.
+pub struct ArrowIpcStep
+    reader: ArrowIpcReader
+    events: [ArrowIpcEvent]
+    // How many bytes of the chunk were consumed.  Less than the chunk's
+    // length when a message straddles it; the caller feeds the rest
+    // back, which is what makes this a state machine rather than a
+    // parser.
+    consumed: Int
+
+// The reader.
+//
+// Its state is the mode, the limits, the schema once seen, the
+// dictionaries installed, and a small pending region — bounded by the
+// schema, not by the data.
+pub struct ArrowIpcReader
+    mode: ArrowIpcMode
+    // The largest metadata block this reader will accept.
+    metadata_limit: Int
+    // The largest body this reader will accept.
+    body_limit: Int
+    // Whether the pre-0.15 framing without a continuation marker is
+    // accepted.
+    legacy: Bool
+    // Messages read so far, which is what a fault's `message`
+    // coordinate counts.
+    messages: Int
+
+// A reader with the default limits.
+//
+// ```novo
+// use arrowipc
+//
+// fn main() [io]
+//     let r = arrowipc.reader(ArrowStreamFormat)
+//     println("${r.messages}")
+// ```
+pub fn reader(mode: ArrowIpcMode) -> ArrowIpcReader
+    todo("arrow-nv.arrowipc.reader")
+
+// The default metadata limit — enough for a schema with tens of
+// thousands of fields and not enough for a header that lies.
+pub fn default_metadata_limit() -> Int
+    todo("arrow-nv.arrowipc.default_metadata_limit")
+
+// The default body limit.
+pub fn default_body_limit() -> Int
+    todo("arrow-nv.arrowipc.default_body_limit")
+
+// A reader that will not accept a metadata block past `cap` bytes.
+pub fn with_metadata_limit(r: ArrowIpcReader, cap: Int) -> ArrowIpcReader
+    todo("arrow-nv.arrowipc.with_metadata_limit")
+
+// A reader that will not accept a body past `cap` bytes.
+//
+// The number that crosses the interface before anything is allocated.
+// A message past it is refused carrying BOTH numbers, so a caller can
+// raise the limit deliberately rather than by trial.
+pub fn with_body_limit(r: ArrowIpcReader, cap: Int) -> ArrowIpcReader
+    todo("arrow-nv.arrowipc.with_body_limit")
+
+// A reader that accepts the pre-0.15 framing, without the continuation
+// marker.
+//
+// Off by default.  A reader that accepted both framings silently would
+// read a corrupt stream as a legacy one, and the corruption would
+// surface as a schema with forty thousand fields.
+pub fn with_legacy(r: ArrowIpcReader) -> ArrowIpcReader
+    todo("arrow-nv.arrowipc.with_legacy")
+
+// Feed a chunk, take whatever finished.
+//
+// `chunk` is the caller's bytes at `chunk_at` in the overall stream,
+// and every span in every event is an offset into THAT chunk — so a
+// caller that keeps the chunk keeps the batch, and one that reuses the
+// chunk must materialise first.  Saying which is the caller's decision
+// and this signature is where it is made.
+pub fn feed(r: ArrowIpcReader, chunk: Bytes, chunk_at: Int) -> Result<ArrowIpcStep, ArrowFault>
+    todo("arrow-nv.arrowipc.feed")
+
+// Tell the reader the stream has ended.
+//
+// Answers `ArrowStreamEnded` for a clean end and `ArrowShortBody` for a
+// stream that stopped inside a message — which is the distinction a
+// caller needs to decide between "done" and "the connection dropped",
+// and one a reader that only answered events could not make.
+pub fn finish(r: ArrowIpcReader) -> Result<[ArrowIpcEvent], ArrowFault>
+    todo("arrow-nv.arrowipc.finish")
+
+// The schema, once the reader has seen it.
+pub fn schema_of(r: ArrowIpcReader) -> Result<ArrowSchema, ArrowFault>
+    todo("arrow-nv.arrowipc.schema_of")
+
+// Whether the reader has seen the schema yet.
+pub fn has_schema(r: ArrowIpcReader) -> Bool
+    todo("arrow-nv.arrowipc.has_schema")
+
+// ── One message at a time, for a caller that already has it whole ───
+
+// The framing of one message: its metadata length, its body length and
+// where each begins, without decoding either.
+pub struct ArrowMessageHeader
+    // Whether the continuation marker was present.
+    continuation: Bool
+    // Byte offset of the FlatBuffers metadata within the message.
+    metadata_at: Int
+    metadata_len: Int
+    // Byte offset of the body, which is the metadata rounded up to 8.
+    body_at: Int
+    body_len: Int
+    kind: ArrowMessageKind
+    // The metadata version the message declares — 4 or 5.
+    version: Int
+
+// Which kind of message it is.
+pub enum ArrowMessageKind
+    ArrowSchemaMessage
+    ArrowDictionaryBatchMessage
+    ArrowRecordBatchMessage
+    // A tensor or a sparse tensor.  Read far enough to step over.
+    ArrowTensorMessage
+    // The zero-length message that ends a stream.
+    ArrowEndOfStream
+
+// The header of the message starting at `at`, without decoding the
+// metadata's contents.
+//
+// One call, so a caller that wants to index a file — read every header,
+// record every offset, decode nothing — does not pay for the schema
+// decode it will not use.
+pub fn read_header(src: Bytes, at: Int, legacy: Bool) -> Result<ArrowMessageHeader, ArrowFault>
+    todo("arrow-nv.arrowipc.read_header")
+
+// The schema a schema message carries.
+pub fn read_schema(src: Bytes, h: ArrowMessageHeader) -> Result<ArrowSchema, ArrowFault>
+    todo("arrow-nv.arrowipc.read_schema")
+
+// The batch a record-batch message describes, as spans into `src` from
+// `h.body_at`.
+//
+// The dictionaries must already be in force: a batch with a
+// dictionary-encoded column and no dictionary installed is
+// `ArrowDictionaryMissing`, not a batch with a hole in it.
+pub fn read_batch(src: Bytes, h: ArrowMessageHeader, s: ArrowSchema,
+                  dicts: [ArrowDictEntry]) -> Result<ArrowBatch, ArrowFault>
+    todo("arrow-nv.arrowipc.read_batch")
+
+// The dictionary a dictionary-batch message carries, and whether it is
+// a delta.
+pub fn read_dictionary(src: Bytes, h: ArrowMessageHeader,
+                       s: ArrowSchema) -> Result<(ArrowDictEntry, Bool), ArrowFault>
+    todo("arrow-nv.arrowipc.read_dictionary")
+
+// The compression a record-batch message declares, if any.
+//
+// Arrow's IPC body compression is LZ4_FRAME or ZSTD applied PER BUFFER,
+// each prefixed with its uncompressed length — and this package does
+// NOT decompress: it answers which codec the message names and refuses
+// to read the buffers, because taking lz4-nv and zstd-nv here would
+// make every consumer of the schema types download two compression
+// codecs.  A `arrow-ipc-zip-nv` over those two is the row that would
+// close it, and it is named here rather than pretended about.
+pub fn compression_of(src: Bytes, h: ArrowMessageHeader) -> Result<Str, ArrowFault>
+    todo("arrow-nv.arrowipc.compression_of")
+
+// ── The file format ─────────────────────────────────────────────────
+
+// Where one message sits in a file, from the footer's index.
+pub struct ArrowBlock
+    // Byte offset of the message from the start of the file.
+    offset: Int
+    metadata_len: Int
+    body_len: Int
+
+// A file's footer: the schema, and the index of every message.
+pub struct ArrowFooter
+    schema: ArrowSchema
+    // Dictionary batches, in the order they must be installed.
+    dictionaries: [ArrowBlock]
+    // Record batches, in file order.
+    batches: [ArrowBlock]
+    version: Int
+
+// The eight bytes a file begins and ends with — `ARROW1\0\0`.
+pub fn file_magic() -> Bytes
+    todo("arrow-nv.arrowipc.file_magic")
+
+// Where the footer begins in a file of `file_len` bytes, given the
+// last ten bytes of it.
+//
+// A file ends with `<footer><int32 footer length><ARROW1\0\0>`, so
+// finding the footer costs a read of the last ten bytes and then one
+// read of the footer — which is the WHOLE argument for the file format
+// over the stream format, and why this is published as arithmetic a
+// caller can do before it has the footer.
+pub fn footer_position(tail: Bytes, file_len: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowipc.footer_position")
+
+// The footer at `at`.
+pub fn read_footer(src: Bytes, at: Int, len: Int) -> Result<ArrowFooter, ArrowFault>
+    todo("arrow-nv.arrowipc.read_footer")
+
+// The blocks a projection over these columns needs, in file order.
+//
+// Every block, because Arrow's file format indexes MESSAGES and not
+// columns: a record batch's buffers are contiguous and a projection
+// reads a subset of them, but the message is one message.  This is
+// published so the answer is visible rather than assumed — a caller
+// that expected column-level seeking wants parquet-nv, and the
+// difference between the two formats is exactly this.
+pub fn blocks_for(f: ArrowFooter, names: [Str]) -> Result<[ArrowBlock], ArrowFault>
+    todo("arrow-nv.arrowipc.blocks_for")
+
+// The byte ranges within one block's body that a projection over these
+// columns actually needs.
+//
+// The half that IS worth having: a batch's buffers are contiguous per
+// column in the walk order, so a projection is a handful of ranges
+// rather than the whole body — and a host reading over a network can
+// issue those ranges.  Answers them coalesced, because two ranges
+// eighty bytes apart are one request.
+pub fn ranges_for(f: ArrowFooter, b: ArrowBlock, names: [Str]) -> Result<[ArrowBuffer], ArrowFault>
+    todo("arrow-nv.arrowipc.ranges_for")
+
+// ── Taking a whole stream from a host ───────────────────────────────
+
+// Read a whole stream, and be charged exactly what the stream costs.
+//
+// `S: Read[e]` binds the effect parameter of the standard library's
+// `Read` trait and the clause is `[e]`, so the row means "whatever the
+// impl behind `S` supplies" — a `File` charges its caller `[io, fs]`,
+// an in-memory buffer charges nothing, and this package stays `core`
+// because it has named no effect of its own.
+//
+// The same machine as `feed` and `finish`, with the pump written once
+// here instead of once per caller.  Use `feed` when the bytes arrive
+// from somewhere this does not fit — a chunked HTTP body, a stream
+// inside an archive, a frame at a time off a socket — and use this
+// otherwise.
+//
+// It MATERIALISES: the events it answers carry batches over a body this
+// call read into memory, so a stream larger than memory wants `feed`.
+// Saying so in the signature is not possible, so it is said here.
+//
+// ```novo
+// use arrowipc
+//
+// fn read_stream(f: File) -> Result<[ArrowIpcEvent], ArrowFault> [io, fs]
+//     arrowipc.read_all(f, ArrowStreamFormat)
+//
+// fn main() [io]
+//     println("a core reader, charged what the host's source costs")
+// ```
+pub fn read_all<S: Read[e]>(src: S, mode: ArrowIpcMode) -> Result<[ArrowIpcEvent], ArrowFault> [e]
+    todo("arrow-nv.arrowipc.read_all")

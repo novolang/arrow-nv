@@ -1,0 +1,229 @@
+// arrowwrite.nv — the IPC stream and file formats, written into a
+// cursor the caller sized.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE WRITER NEVER ALLOCATES THE OUTPUT.  Every call here takes a
+// `Cursor` the caller built over its own `Bytes` and answers how many
+// bytes it wrote, so a program that writes a batch per second allocates
+// its destination once.  The arithmetic that sizes it is
+// `message_bound` and `body_bound`, published above the writers for
+// exactly that reason — a writer whose only size answer came after the
+// write would force a two-pass caller or a growable buffer, and a
+// growable buffer in a `core` package is the allocation strategy this
+// layer does not get to choose.
+//
+// A WRITE THAT DOES NOT FIT WRITES NOTHING.  `ArrowWriteBufferTooSmall`
+// carries what was wanted and what there was, and the cursor is
+// untouched — a partial message in a caller's buffer is worse than no
+// message, because the caller cannot tell how much of it to keep.
+//
+// THE BODY IS THE CALLER'S, AND SO IS ITS LAYOUT.  A batch's buffers
+// are spans into a body that already exists: this package does not
+// build a body, it writes the METADATA that describes one and then
+// copies the body through.  A caller that assembled its columns into
+// one contiguous `Bytes` with the right padding writes it with
+// `write_batch`; one that has its buffers scattered uses
+// `write_batch_parts`, which copies them into the cursor in walk order
+// and pads between them.  Two calls rather than one, because the first
+// is a memcpy and the second is a gather, and a caller should be able
+// to tell which it is paying for.
+//
+// WHAT THIS WRITER DOES NOT DO, named rather than implied:
+//
+//   - No body compression.  Arrow's IPC compression is per-buffer LZ4
+//     frame or ZSTD, and taking those two codecs here would put them in
+//     every consumer's dependency closure to serve the minority of
+//     streams that use them.  `arrowipc.compression_of` reads the field
+//     and refuses; the row that closes it is named there.
+//   - No dictionary BUILDING.  A dictionary-encoded column arrives with
+//     its indices already computed; deciding what to intern is a
+//     decision about the data, and a format library that made it would
+//     be choosing a hash table for its callers.
+//   - No re-chunking.  A batch is written as it is.  Splitting a large
+//     batch is `arrowcol.slice` in a loop, which costs nothing, and
+//     doing it inside the writer would hide the memory the caller is
+//     about to spend.
+
+// Which format the writer is producing.
+pub struct ArrowWriter
+    mode: ArrowIpcMode
+    schema: ArrowSchema
+    // How many bytes have been written across every call, which is what
+    // the file footer's block offsets count from.
+    written: Int
+    // Where each message went, for the footer.  Empty in stream mode.
+    blocks: [ArrowBlock]
+    // Whether the schema message has been written yet.
+    schema_written: Bool
+    // The dictionary ids already sent, so a second batch does not
+    // re-send them and a delta is distinguishable from a replacement.
+    dictionaries_sent: [Int]
+
+// A writer for a schema.
+//
+// ```novo
+// use arrowwrite
+// use arrowtype
+//
+// fn main() [io]
+//     let s = arrowtype.schema([arrowtype.field("n", ArrowInt64, false)])
+//     let w = arrowwrite.writer(ArrowStreamFormat, s)
+//     println("${w.written}")
+// ```
+pub fn writer(mode: ArrowIpcMode, schema: ArrowSchema) -> ArrowWriter
+    todo("arrow-nv.arrowwrite.writer")
+
+// ── Sizing, before anything is written ──────────────────────────────
+
+// An upper bound on the schema message's size.
+pub fn schema_message_bound(s: ArrowSchema) -> Int
+    todo("arrow-nv.arrowwrite.schema_message_bound")
+
+// An upper bound on one record-batch message's METADATA, given the
+// batch's shape.
+//
+// Metadata only: the body is the caller's and its size is
+// `body_bound`.  Two numbers because a caller streaming into a socket
+// writes the metadata into a small reusable buffer and the body
+// straight through.
+pub fn metadata_bound(b: ArrowBatch) -> Int
+    todo("arrow-nv.arrowwrite.metadata_bound")
+
+// The number of bytes a batch's body occupies once every buffer is
+// padded to the required alignment.
+//
+// EXACT, not a bound: padding is arithmetic and a caller writing into a
+// preallocated file needs the number, not a ceiling.
+pub fn body_bound(b: ArrowBatch) -> Int
+    todo("arrow-nv.arrowwrite.body_bound")
+
+// An upper bound on a whole message — metadata, padding and body.
+pub fn message_bound(b: ArrowBatch) -> Int
+    todo("arrow-nv.arrowwrite.message_bound")
+
+// An upper bound on the file footer for a file with this many
+// dictionary and record-batch blocks.
+pub fn footer_bound(s: ArrowSchema, dictionaries: Int, batches: Int) -> Int
+    todo("arrow-nv.arrowwrite.footer_bound")
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// The file format's opening magic.  Nothing in stream mode.
+pub fn write_prologue(w: ArrowWriter, mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    todo("arrow-nv.arrowwrite.write_prologue")
+
+// The schema message.  Exactly once, first.
+pub fn write_schema(w: ArrowWriter, mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    todo("arrow-nv.arrowwrite.write_schema")
+
+// A dictionary batch.
+//
+// `is_delta` APPENDS to the dictionary already sent under this id
+// rather than replacing it, and the two are not interchangeable: a
+// reader that took a delta as a replacement resolves every index past
+// the delta's length to nothing.  A writer that sends a replacement for
+// an id it already sent is legal and a reader must handle it, which is
+// why this is an argument rather than derived from what came before.
+pub fn write_dictionary(w: ArrowWriter, entry: ArrowDictEntry, is_delta: Bool,
+                        mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    todo("arrow-nv.arrowwrite.write_dictionary")
+
+// A record batch whose body the caller already has contiguous and
+// padded.
+//
+// The fast path: the metadata is built from the batch's spans and the
+// body is copied through unchanged.  `arrowcol.validate_batch` is what
+// says whether the body really is what the spans claim, and this call
+// does not re-run it — a writer that validated every batch would make
+// the check unavoidable for a caller that built the batch itself and
+// knows.
+pub fn write_batch(w: ArrowWriter, b: ArrowBatch, body: Bytes,
+                   mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    todo("arrow-nv.arrowwrite.write_batch")
+
+// A record batch whose buffers are scattered across several of the
+// caller's own byte strings.
+//
+// The gather path: `parts` is one `Bytes` per buffer in
+// `arrowcol.flatten_buffers` order, and this writes them into the
+// cursor with the padding between them.  A caller that built a column
+// at a time has its buffers this way and would otherwise have to
+// concatenate them first — which is the allocation this package exists
+// not to make.
+pub fn write_batch_parts(w: ArrowWriter, b: ArrowBatch, parts: [Bytes],
+                         mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    todo("arrow-nv.arrowwrite.write_batch_parts")
+
+// The end of a stream: the zero-length message.
+//
+// In file mode this also writes the footer, its length and the trailing
+// magic — which is why it is one call: a file whose footer is missing
+// is a file no reader opens, and a caller that could forget it would.
+pub fn finish(w: ArrowWriter, mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    todo("arrow-nv.arrowwrite.finish")
+
+// ── Building the pieces a batch is made of ──────────────────────────
+
+// A validity bitmap for these presence flags, written into a cursor.
+//
+// LSB first within each byte, padded to the alignment, and the trailing
+// bits of the last byte set to zero — which is not required by the
+// specification and IS required by every implementation that counts
+// nulls with a population count over whole words.
+pub fn write_validity(present: [Bool], mut dst: Cursor) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowwrite.write_validity")
+
+// A 32-bit offsets buffer for these element lengths.
+//
+// `length + 1` entries, the first `0`.  Answers
+// `ArrowOffsetPastEnd` when the total exceeds what a 32-bit offset can
+// hold, which is the moment a caller has to move to `LargeUtf8` and the
+// moment an implementation that wrapped would corrupt silently.
+pub fn write_offsets32(lengths: [Int], mut dst: Cursor) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowwrite.write_offsets32")
+
+// A 64-bit offsets buffer.
+pub fn write_offsets64(lengths: [Int], mut dst: Cursor) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowwrite.write_offsets64")
+
+// A fixed-width values buffer from integers, at `bits` per element.
+pub fn write_ints(values: [Int], bits: Int, mut dst: Cursor) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowwrite.write_ints")
+
+// A fixed-width values buffer from floats, at `bits` per element.
+//
+// `bits` of 16 or 32 ROUNDS, and the rounding is to nearest with ties
+// to even — the IEEE default, named here because a value that does not
+// round-trip is the reason a caller chose 64 in the first place.
+pub fn write_floats(values: [Float], bits: Int, mut dst: Cursor) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowwrite.write_floats")
+
+// A `Bool` values buffer — one BIT per element.
+pub fn write_bits(values: [Bool], mut dst: Cursor) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowwrite.write_bits")
+
+// Zero bytes up to the next alignment boundary.
+//
+// Published because a caller assembling a body by hand has to pad
+// between buffers, and because the padding is what a reader's offsets
+// assume.
+pub fn write_padding(written: Int, mut dst: Cursor) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowwrite.write_padding")
+
+// ── Writing a whole stream to a host ────────────────────────────────
+
+// Write a schema and a sequence of batches, and be charged exactly what
+// the destination costs.
+//
+// `S: Write[e]` binds the effect parameter of the standard library's
+// `Write` trait and the clause is `[e]`, so a `File` charges its caller
+// `[io, fs]`, an in-memory sink charges nothing, and this package
+// remains `core`.
+//
+// The convenience over the cursor writers, not a replacement: a caller
+// that cannot give up control still needs them, and one writing a file
+// in a loop should not have to write the pump.
+pub fn write_all<S: Write[e]>(mode: ArrowIpcMode, s: ArrowSchema, batches: [ArrowBatch],
+                              bodies: [Bytes], sink: S) -> Result<Int, ArrowFault> [e]
+    todo("arrow-nv.arrowwrite.write_all")

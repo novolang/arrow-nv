@@ -1,0 +1,195 @@
+// arrowtime.nv — the temporal logical types, as counts and as civil
+// values.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A TEMPORAL COLUMN IS INTEGERS, AND THAT IS THE FORMAT.  `Date32` is
+// days since 1970-01-01; `Timestamp(Micro, zone)` is microseconds since
+// the same instant; `Time64(Nano)` is nanoseconds since midnight with
+// no date at all.  Nothing in a buffer is a date — the date is what the
+// SCHEMA says the integer means, which is why `arrowtype.ArrowType`
+// carries the unit and why two timestamp columns with different units
+// are two types.
+//
+// THE ZONE IS A STRING THIS PACKAGE CARRIES AND DOES NOT READ, and the
+// distinction that matters is between an EMPTY zone and any other:
+//
+//   `Timestamp(unit, "")`        a WALL CLOCK.  The values have no
+//                                zone; they are what a clock on a wall
+//                                said.  Two rows recorded in Oslo and
+//                                in Tokyo at the same instant carry
+//                                different numbers, on purpose.
+//   `Timestamp(unit, "UTC")`     an INSTANT, recorded in UTC.
+//   `Timestamp(unit, "Europe/Oslo")`
+//                                an INSTANT, and the zone is how it
+//                                should be DISPLAYED.  The values are
+//                                still UTC counts.
+//
+// Every implementation that defaults an empty zone to UTC shifts
+// somebody's data by their offset with no error anywhere, so this
+// package refuses to guess: `is_wall_clock` is the question, and
+// `to_civil` on a zoned timestamp answers the UTC civil value with the
+// zone name beside it for a host to resolve.  Resolving a zone name
+// needs a timezone database, which is a host's and not a `core`
+// package's — `std.time`'s `Zoned` is where that lives.
+//
+// `Date64` HAS A RULE MOST PRODUCERS BREAK.  It is milliseconds since
+// the epoch AND the specification requires the value to be an exact
+// multiple of 86_400_000.  A producer that writes a time of day into a
+// `Date64` writes a file whose dates are right in its own reader and
+// off by a day in a reader that divides.  `check_date64` is the
+// producer-side check and `date64_to_civil` truncates rather than
+// rounds, which is what a conforming reader does.
+
+use civil
+
+// The epoch every Arrow date and timestamp counts from — 1970-01-01.
+pub fn epoch() -> civil.CivilDate
+    todo("arrow-nv.arrowtime.epoch")
+
+// How many of a unit there are in one second.
+//
+// `1`, `1_000`, `1_000_000`, `1_000_000_000`.  Published because
+// converting between two units is a multiply or a divide by the ratio
+// of these, and a table beats four branches at every call site.
+pub fn ticks_per_second(u: ArrowTimeUnit) -> Int
+    todo("arrow-nv.arrowtime.ticks_per_second")
+
+// The unit's name as the IPC metadata spells it — `SECOND`,
+// `MILLISECOND`, `MICROSECOND`, `NANOSECOND`.
+pub fn unit_name(u: ArrowTimeUnit) -> Str
+    todo("arrow-nv.arrowtime.unit_name")
+
+// A count in `from` converted to `to`.
+//
+// Truncates toward negative infinity when narrowing, which is the
+// answer that keeps dates correct before 1970: a value of `-1` second
+// is `-1_000` millis and not `-999`, and a conversion that truncated
+// toward zero would put 1969-12-31T23:59:59 on the wrong day.
+pub fn convert(value: Int, from: ArrowTimeUnit, to: ArrowTimeUnit) -> Int
+    todo("arrow-nv.arrowtime.convert")
+
+// Whether a narrowing conversion of this value loses anything.
+//
+// The check a caller runs before writing a nanosecond column out as
+// milliseconds, because the loss is silent otherwise.
+pub fn convert_is_exact(value: Int, from: ArrowTimeUnit, to: ArrowTimeUnit) -> Bool
+    todo("arrow-nv.arrowtime.convert_is_exact")
+
+// ── Dates ───────────────────────────────────────────────────────────
+
+// A `Date32` day count as a civil date.
+//
+// ```novo
+// use arrowtime
+//
+// fn main() [io]
+//     match arrowtime.date32_to_civil(20000)
+//         Ok(d)  => println("${d.year}")
+//         Err(_) => println("out of range")
+// ```
+pub fn date32_to_civil(days: Int) -> Result<civil.CivilDate, ArrowFault>
+    todo("arrow-nv.arrowtime.date32_to_civil")
+
+// A civil date as a `Date32` day count.
+pub fn civil_to_date32(d: civil.CivilDate) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowtime.civil_to_date32")
+
+// A `Date64` millisecond count as a civil date, truncating toward the
+// start of the day.
+pub fn date64_to_civil(millis: Int) -> Result<civil.CivilDate, ArrowFault>
+    todo("arrow-nv.arrowtime.date64_to_civil")
+
+// A civil date as a `Date64` millisecond count, which is always a
+// multiple of 86_400_000.
+pub fn civil_to_date64(d: civil.CivilDate) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowtime.civil_to_date64")
+
+// Whether a `Date64` value keeps the specification's rule.
+//
+// A PRODUCER's check.  A reader that refused would refuse files that
+// exist, and `date64_to_civil` truncates instead — but a writer that
+// runs this catches the bug where a millisecond timestamp was stored in
+// a date column, which is the way this goes wrong.
+pub fn check_date64(millis: Int) -> Bool
+    todo("arrow-nv.arrowtime.check_date64")
+
+// ── Times of day ────────────────────────────────────────────────────
+
+// A `Time32` or `Time64` count as a civil time of day.
+//
+// The unit decides the width and the legal range: `Time32` is `Second`
+// or `Milli` and `Time64` is `Micro` or `Nano`, which
+// `arrowtype.check_type` enforces and this function assumes.  A value
+// past the end of the day is `ArrowIndexOutOfRange` rather than
+// wrapping, because a time of 25 hours is a producer bug and wrapping
+// it hides one.
+pub fn time_to_civil(value: Int, u: ArrowTimeUnit) -> Result<civil.CivilTime, ArrowFault>
+    todo("arrow-nv.arrowtime.time_to_civil")
+
+// A civil time of day as a count in `unit`, truncating sub-unit
+// precision.
+pub fn civil_to_time(t: civil.CivilTime, u: ArrowTimeUnit) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowtime.civil_to_time")
+
+// ── Timestamps ──────────────────────────────────────────────────────
+
+// A timestamp count as a civil datetime, in whatever frame the column
+// is in.
+//
+// For a zoned column that frame is UTC and `zone_of` is what a caller
+// hands to a host to convert; for an unzoned column there is no frame
+// at all and the value IS the wall clock.  The two are the same
+// arithmetic and different meanings, which is why this answers the
+// civil value and never a `Zoned`.
+pub fn timestamp_to_civil(value: Int, u: ArrowTimeUnit) -> Result<civil.CivilDateTime, ArrowFault>
+    todo("arrow-nv.arrowtime.timestamp_to_civil")
+
+// A civil datetime as a timestamp count in `unit`.
+pub fn civil_to_timestamp(dt: civil.CivilDateTime, u: ArrowTimeUnit) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowtime.civil_to_timestamp")
+
+// The zone a timestamp type names, or the empty string.
+pub fn zone_of(t: ArrowType) -> Str
+    todo("arrow-nv.arrowtime.zone_of")
+
+// Whether a timestamp type has no zone — whether its values are a wall
+// clock rather than instants.
+//
+// The question this module exists to make askable.  A caller that
+// treats a wall clock as UTC has moved every value by its recorder's
+// offset, and nothing downstream can tell.
+pub fn is_wall_clock(t: ArrowType) -> Bool
+    todo("arrow-nv.arrowtime.is_wall_clock")
+
+// The unit a temporal type counts in, for the types that have one.
+pub fn unit_of(t: ArrowType) -> Result<ArrowTimeUnit, ArrowFault>
+    todo("arrow-nv.arrowtime.unit_of")
+
+// ── Durations and intervals ─────────────────────────────────────────
+
+// A `Duration` count as calendar-nv's `TimeDelta`.
+//
+// A duration is exact elapsed time, so this is a pure scaling and
+// always succeeds within range.
+pub fn duration_to_delta(value: Int, u: ArrowTimeUnit) -> Result<civil.TimeDelta, ArrowFault>
+    todo("arrow-nv.arrowtime.duration_to_delta")
+
+// The months, days and nanoseconds an interval element carries.
+//
+// Three numbers and not one, and NOT convertible to a duration: a month
+// is not a fixed number of days and a day is not a fixed number of
+// nanoseconds across a daylight-saving boundary.  An interval applies
+// to a date, in that order — months, then days, then nanos — and the
+// order is part of the answer because applying them in another order
+// gives a different date at a month end.
+pub fn interval_parts(months: Int, days: Int, nanos: Int) -> (Int, Int, Int)
+    todo("arrow-nv.arrowtime.interval_parts")
+
+// How many bytes one element of an interval type occupies — 4, 8 or 16.
+pub fn interval_width(u: ArrowIntervalUnit) -> Int
+    todo("arrow-nv.arrowtime.interval_width")
+
+// The interval unit's name as the IPC metadata spells it.
+pub fn interval_unit_name(u: ArrowIntervalUnit) -> Str
+    todo("arrow-nv.arrowtime.interval_unit_name")

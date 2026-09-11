@@ -1,0 +1,428 @@
+// arrowtype.nv — the Arrow schema: every logical type, the fields that
+// carry them, and the arithmetic that says how many buffers and how
+// many children each one has.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE TYPE DECIDES THE LAYOUT, AND THAT IS THE WHOLE FORMAT.  Arrow's
+// columnar specification is two tables: one from a logical type to the
+// buffers an array of it owns, and one from a logical type to its
+// children.  `buffer_count_of` and `child_count_of` here are those two
+// tables, and `arrowbuf.layout_of` says what each buffer MEANS.  A
+// reader that hard-codes "validity, offsets, values" everywhere gets
+// `Bool` wrong (no offsets, and the values are bits), `Struct` wrong
+// (no values at all), `FixedSizeList` wrong (no offsets — the width is
+// in the type) and both unions wrong (no validity — a union's nulls
+// live in its children).
+//
+// DICTIONARY ENCODING IS A PROPERTY OF THE FIELD, NOT OF THE TYPE.
+// This is the part of Arrow most ports get backwards.  A
+// dictionary-encoded field's `data_type` is the type of the VALUES, and
+// the array in the batch holds INDICES whose type is in
+// `ArrowDict.index_type`.  So `arrowbuf.layout_of` is asked about the
+// index type when a dictionary is present, and the values arrive in a
+// separate dictionary-batch message keyed by `ArrowDict.id`.  A field
+// is the only place both facts sit together, which is why the encoding
+// hangs off `ArrowField` and not off `ArrowType`.
+//
+// WHAT IS NOT HERE, and why each one is named rather than approximated:
+//
+//   Utf8View / BinaryView / ListView / LargeListView — the view
+//     layouts added in Arrow 14.  Their buffer list is variable-length
+//     (a data buffer per variadic block), so `buffer_count_of` would
+//     stop being a function of the type alone and every signature in
+//     `arrowbuf` would take the message's buffer list as well.  They
+//     get their own row when a consumer needs them.
+//   RunEndEncoded — a run-length layout whose length is not the length
+//     of any of its buffers.  Same reason.
+//   Tensor / SparseTensor — IPC messages that are not record batches at
+//     all.  `arrowipc` refuses them by name.
+//   The C data interface, and memory mapping — both are a HOST's way of
+//     getting bytes, and this package takes bytes it is handed.  A
+//     `arrow-ffi-nv` on the bindings shelf is where the C data
+//     interface belongs; memory mapping belongs to whatever `host`
+//     package opens the file, and it changes nothing here because a
+//     mapped file and a read file are the same `Bytes` to every
+//     signature in this package.
+
+// How precise a time-valued column is.
+//
+// The unit is part of the TYPE, not of the value, which is what lets a
+// column of timestamps be eight bytes each with no per-value tag — and
+// what makes `Timestamp(Second)` and `Timestamp(Nano)` two different
+// types that a schema comparison must not collapse.
+pub enum ArrowTimeUnit
+    ArrowSecond
+    ArrowMilli
+    ArrowMicro
+    ArrowNano
+
+// What an interval counts.
+//
+// Three, because a month is not a fixed number of days and a day is not
+// a fixed number of nanoseconds, so "an interval" cannot be one number.
+pub enum ArrowIntervalUnit
+    // Months, as one 32-bit count.
+    ArrowYearMonth
+    // Days and milliseconds, as two 32-bit counts.
+    ArrowDayTime
+    // Months, days and nanoseconds — 4 + 4 + 8 bytes.
+    ArrowMonthDayNano
+
+// How a union stores its children.
+pub enum ArrowUnionMode
+    // Every child is as long as the union, and the type id selects
+    // which child holds the value at that index.  Wasteful and random
+    // access is one read.
+    ArrowSparseUnion
+    // Children are packed, and a second buffer gives each element's
+    // offset into its own child.  Compact and random access is two
+    // reads.
+    ArrowDenseUnion
+
+// Which end the buffers' words are stored at.
+//
+// Arrow's buffers are raw machine words: the metadata is flatbuffers
+// and always little-endian, but an `Int32` column is four native bytes.
+// A big-endian stream is therefore not readable by swapping the
+// metadata, which is what `ArrowEndianMismatch` says rather than
+// pretending.
+pub enum ArrowEndian
+    ArrowLittle
+    ArrowBig
+
+// One logical type.
+//
+// The set is the columnar specification's, minus the four named
+// absences in this module's header.  Every variant that carries a
+// parameter carries it here rather than in the field, because two
+// timestamps with different units are two types.
+pub enum ArrowType
+    // No values at all.  An array of `Null` has a length and no
+    // buffers, which is the one case where "how many buffers" is zero.
+    ArrowNull
+    // One BIT per value, in a bitmap — not one byte.  The mistake that
+    // makes a boolean column read as garbage eight elements at a time.
+    ArrowBool
+    ArrowInt8
+    ArrowInt16
+    ArrowInt32
+    ArrowInt64
+    ArrowUInt8
+    ArrowUInt16
+    ArrowUInt32
+    ArrowUInt64
+    // IEEE 754 binary16.  Stored as two bytes; novo-lang has no `f16`,
+    // so `arrowcol.float_at` widens on read and `arrowwrite` narrows on
+    // write, and the rounding that costs is said in `arrowcol`.
+    ArrowFloat16
+    ArrowFloat32
+    ArrowFloat64
+    // Variable-length UTF-8 with 32-bit offsets.
+    ArrowUtf8
+    // Variable-length UTF-8 with 64-bit offsets.
+    ArrowLargeUtf8
+    // Variable-length bytes with 32-bit offsets.
+    ArrowBinary
+    // Variable-length bytes with 64-bit offsets.
+    ArrowLargeBinary
+    // `width` bytes per value, no offsets buffer.
+    ArrowFixedSizeBinary(width: Int)
+    // A 128-bit two's-complement integer scaled by `10^-scale`.
+    ArrowDecimal128(precision: Int, scale: Int)
+    // The same at 256 bits.
+    ArrowDecimal256(precision: Int, scale: Int)
+    // Days since 1970-01-01, as an `Int32`.
+    ArrowDate32
+    // Milliseconds since 1970-01-01, as an `Int64`, and the spec
+    // REQUIRES the value to be an exact multiple of 86_400_000.  A
+    // producer that writes a time of day into a `Date64` produces a
+    // file every conforming reader disagrees with.
+    ArrowDate64
+    // Time of day as an `Int32`.  Only `ArrowSecond` and `ArrowMilli`
+    // are legal units; `arrowtype.check_type` refuses the others.
+    ArrowTime32(unit: ArrowTimeUnit)
+    // Time of day as an `Int64`.  Only `ArrowMicro` and `ArrowNano`.
+    ArrowTime64(unit: ArrowTimeUnit)
+    // An `Int64` count since the epoch, plus the zone the values were
+    // recorded in.
+    //
+    // The zone is a STRING and an EMPTY one is not the same as
+    // `"UTC"` — it means the values have no zone at all, a wall clock
+    // rather than an instant.  Every implementation that defaults an
+    // empty zone to UTC shifts somebody's data by their offset, so this
+    // package carries the string unread and `arrowtime` says so.
+    ArrowTimestamp(unit: ArrowTimeUnit, zone: Str)
+    // A span of time with no anchor.
+    ArrowInterval(unit: ArrowIntervalUnit)
+    // An `Int64` elapsed time in `unit`.  Distinct from `Interval`:
+    // a duration is exact arithmetic, an interval is calendar
+    // arithmetic.
+    ArrowDuration(unit: ArrowTimeUnit)
+    // A variable-length list with 32-bit offsets.  One child.
+    ArrowList
+    // The same with 64-bit offsets.
+    ArrowLargeList
+    // `width` elements per value, no offsets.  One child.
+    ArrowFixedSizeList(width: Int)
+    // A record.  As many children as the field declares, no values
+    // buffer, and every child is as long as the struct.
+    ArrowStruct
+    // A map.  ONE child, which must be a non-nullable `Struct` of
+    // exactly two fields named `key` (non-nullable) and `value`.  A map
+    // is a list of those, so the layout is `List`'s.  `keys_sorted` is
+    // a claim the producer makes and no reader verifies — which is
+    // stated here because a consumer that binary-searches on the
+    // strength of it will read wrong answers from a producer that lied.
+    ArrowMap(keys_sorted: Bool)
+    // A union with the given mode.  The type ids are on the FIELD, not
+    // here, because they are a list as long as the children.
+    ArrowUnion(mode: ArrowUnionMode)
+
+// Dictionary encoding, as it hangs off a field.
+pub struct ArrowDict
+    // The id the dictionary batch carries.  Ids are per-stream and two
+    // fields may share one, which is the whole point: a schema with
+    // forty low-cardinality string columns sends one dictionary.
+    id: Int
+    // The type of the INDICES stored in the batch — one of the signed
+    // or unsigned integer types.  The field's own `data_type` is the
+    // type of the VALUES.
+    index_type: ArrowType
+    // Whether the dictionary's values are ordered, so a consumer may
+    // compare indices instead of values.  A producer's claim.
+    ordered: Bool
+
+// A key and a value from a schema's or a field's custom metadata.
+//
+// A struct rather than a tuple because a list of tuples cannot be
+// indexed by name without unpacking, and because the name of each half
+// is worth having at every call site.
+pub struct ArrowKeyValue
+    key: Str
+    value: Str
+
+// One column of a schema, or one child of a nested type.
+pub struct ArrowField
+    name: Str
+    // For a dictionary-encoded field this is the type of the VALUES.
+    // See this module's header.
+    data_type: ArrowType
+    nullable: Bool
+    // The children a nested type requires: one for `List`, `LargeList`,
+    // `FixedSizeList` and `Map`, any number for `Struct` and both
+    // unions, none for everything else.
+    children: [ArrowField]
+    // Present exactly when the field is dictionary-encoded.
+    dictionary: ?ArrowDict
+    // For a union, the type id of each child, in the children's order.
+    // Empty for every other type.  A list rather than "the child index"
+    // because the ids are chosen by the producer and need not be
+    // `0..n`.
+    type_ids: [Int]
+    metadata: [ArrowKeyValue]
+
+// A schema: the columns of every record batch in a stream.
+pub struct ArrowSchema
+    fields: [ArrowField]
+    metadata: [ArrowKeyValue]
+    endianness: ArrowEndian
+
+// A field with no children, no dictionary and no metadata.
+//
+// ```novo
+// use arrowtype
+//
+// fn main() [io]
+//     let f = arrowtype.field("price", ArrowFloat64, true)
+//     println(f.name)
+// ```
+pub fn field(name: Str, data_type: ArrowType, nullable: Bool) -> ArrowField
+    todo("arrow-nv.arrowtype.field")
+
+// A field with children — a list, a struct, a map or a union.
+pub fn nested_field(name: Str, data_type: ArrowType, nullable: Bool,
+                    children: [ArrowField]) -> ArrowField
+    todo("arrow-nv.arrowtype.nested_field")
+
+// A field with a dictionary encoding over an index type.
+//
+// `values` is the type of the dictionary's VALUES and `index_type` the
+// type stored in the batch, which is the way round the format has it
+// and the way round a caller gets wrong.
+pub fn dict_field(name: Str, values: ArrowType, index_type: ArrowType, id: Int, ordered: Bool,
+                  nullable: Bool) -> ArrowField
+    todo("arrow-nv.arrowtype.dict_field")
+
+// The struct a `Map`'s single child must be — `entries { key, value }`,
+// non-nullable, with a non-nullable key.
+//
+// Published because a hand-built map field is wrong four times out of
+// five, and because `check_field` refuses every one of those ways.
+pub fn map_entries(key: ArrowType, value: ArrowType, value_nullable: Bool) -> ArrowField
+    todo("arrow-nv.arrowtype.map_entries")
+
+// A schema from fields, little-endian, no metadata.
+pub fn schema(fields: [ArrowField]) -> ArrowSchema
+    todo("arrow-nv.arrowtype.schema")
+
+// A schema with custom metadata.
+pub fn schema_with(fields: [ArrowField], metadata: [ArrowKeyValue],
+                   endianness: ArrowEndian) -> ArrowSchema
+    todo("arrow-nv.arrowtype.schema_with")
+
+// The index of the field with this name, or `-1`.
+//
+// Names are not unique in Arrow — the format permits two fields called
+// `id` — so this answers the FIRST and `check_schema` reports the
+// duplicate as `ArrowDuplicateName`.  A caller that resolves columns by
+// name on a schema that did not pass the check is reading whichever one
+// the producer happened to write first.
+pub fn field_index(s: ArrowSchema, name: Str) -> Int
+    todo("arrow-nv.arrowtype.field_index")
+
+// The field at an index.
+pub fn field_at(s: ArrowSchema, i: Int) -> Result<ArrowField, ArrowFault>
+    todo("arrow-nv.arrowtype.field_at")
+
+// How many buffers an array of this type owns.
+//
+// ONE OF THE TWO TABLES THIS MODULE IS.  The answers, and each one is a
+// place a hard-coded reader is wrong:
+//
+//   `Null`                             0   — length only
+//   `Bool`, every int, every float,
+//   `Decimal`, every temporal,
+//   `FixedSizeBinary`                  2   — validity, values
+//   `Utf8`, `Binary` and the large
+//   forms                              3   — validity, offsets, values
+//   `List`, `LargeList`, `Map`         2   — validity, offsets
+//   `FixedSizeList`, `Struct`          1   — validity
+//   `ArrowSparseUnion`                 1   — type ids, and NO validity
+//   `ArrowDenseUnion`                  2   — type ids, offsets, no validity
+//
+// A union has no validity bitmap at all: a null in a union is a null in
+// the child the type id selects.  A reader that allocates a validity
+// buffer for one is off by one buffer for the whole rest of the batch,
+// which is why `ArrowBufferCountWrong` exists and says how many it
+// wanted.
+pub fn buffer_count_of(t: ArrowType) -> Int
+    todo("arrow-nv.arrowtype.buffer_count_of")
+
+// How many children a field of this type must declare.
+//
+// THE OTHER TABLE.  `-1` means "any number", which is `Struct` and both
+// unions; every other type answers 0 or 1.
+pub fn child_count_of(t: ArrowType) -> Int
+    todo("arrow-nv.arrowtype.child_count_of")
+
+// Whether values of this type are fixed width, and how wide in BITS.
+//
+// Bits rather than bytes because `Bool` is one bit and that is the
+// whole reason a boolean column is not a byte array.  `0` means the
+// type is not fixed width.
+pub fn fixed_width_bits(t: ArrowType) -> Int
+    todo("arrow-nv.arrowtype.fixed_width_bits")
+
+// Whether the type has children.
+pub fn is_nested(t: ArrowType) -> Bool
+    todo("arrow-nv.arrowtype.is_nested")
+
+// Whether values of this type are variable width with an offsets
+// buffer.
+pub fn has_offsets(t: ArrowType) -> Bool
+    todo("arrow-nv.arrowtype.has_offsets")
+
+// Whether the offsets buffer for this type holds 64-bit entries.
+pub fn has_large_offsets(t: ArrowType) -> Bool
+    todo("arrow-nv.arrowtype.has_large_offsets")
+
+// Whether an array of this type carries a validity bitmap at all.
+//
+// False for `Null` and for both unions, true for everything else — and
+// still true for a non-nullable field, because the FORMAT allows the
+// buffer to be present and empty and a reader may not assume.
+pub fn has_validity(t: ArrowType) -> Bool
+    todo("arrow-nv.arrowtype.has_validity")
+
+// Whether an integer type may index a dictionary.
+pub fn is_index_type(t: ArrowType) -> Bool
+    todo("arrow-nv.arrowtype.is_index_type")
+
+// The type's name as the IPC metadata spells it — `utf8`, `timestamp`,
+// `fixedsizebinary`.
+pub fn type_name(t: ArrowType) -> Str
+    todo("arrow-nv.arrowtype.type_name")
+
+// Whether two types are the same type.
+//
+// Written out rather than left to `==` because two timestamps differ by
+// their zone STRING and two decimals by two integers, and because a
+// schema comparison that collapsed `Timestamp(Micro, "")` and
+// `Timestamp(Micro, "UTC")` would accept a batch whose values are
+// shifted by an offset nobody can recover.
+pub fn type_eq(a: ArrowType, b: ArrowType) -> Bool
+    todo("arrow-nv.arrowtype.type_eq")
+
+// Whether two fields are the same field, children and dictionary
+// included.
+pub fn field_eq(a: ArrowField, b: ArrowField) -> Bool
+    todo("arrow-nv.arrowtype.field_eq")
+
+// Whether two schemas agree well enough that batches of one can be read
+// as the other.
+//
+// Not `field_eq` over the list: metadata does not participate, because
+// a producer that added a custom key has not changed the data, and a
+// reader that refused would refuse every file written by a newer
+// version of its own writer.
+pub fn schema_compatible(a: ArrowSchema, b: ArrowSchema) -> Bool
+    todo("arrow-nv.arrowtype.schema_compatible")
+
+// Every way a type can be wrong on its own — a `Time32` in
+// microseconds, a `Decimal128` with precision 40, a
+// `FixedSizeBinary(0)`.
+pub fn check_type(t: ArrowType) -> [ArrowFault]
+    todo("arrow-nv.arrowtype.check_type")
+
+// Every way a field can be wrong — its type, its child count, a `Map`
+// whose child is not the entries struct, a union whose type-id list is
+// not as long as its children, a dictionary whose index type is not an
+// integer.
+//
+// Answers every fault rather than the first, because a hand-built
+// schema usually has two.
+pub fn check_field(f: ArrowField) -> [ArrowFault]
+    todo("arrow-nv.arrowtype.check_field")
+
+// Every way a schema can be wrong, its fields' faults included, with
+// duplicate names reported at the level they occur.
+pub fn check_schema(s: ArrowSchema) -> [ArrowFault]
+    todo("arrow-nv.arrowtype.check_schema")
+
+// Whether a schema passes every check.
+pub fn schema_ok(s: ArrowSchema) -> Bool
+    todo("arrow-nv.arrowtype.schema_ok")
+
+// The dotted path of every field in the schema, in the pre-order walk
+// `arrowcol` and `arrowipc` use.
+//
+// Published because the path is what a fault names, and because a
+// caller comparing two producers' buffer counts needs the same walk
+// this package uses rather than one it wrote itself.
+pub fn field_paths(s: ArrowSchema) -> [Str]
+    todo("arrow-nv.arrowtype.field_paths")
+
+// How many field nodes a batch of this schema carries — the length of
+// the pre-order walk.
+pub fn node_count_of(s: ArrowSchema) -> Int
+    todo("arrow-nv.arrowtype.node_count_of")
+
+// How many buffers a batch of this schema carries — the sum of
+// `buffer_count_of` over the same walk.
+//
+// The number `ArrowBufferCountWrong` compares against, and the one
+// number that catches a producer whose walk order differs from this
+// one.
+pub fn buffer_count_of_schema(s: ArrowSchema) -> Int
+    todo("arrow-nv.arrowtype.buffer_count_of_schema")

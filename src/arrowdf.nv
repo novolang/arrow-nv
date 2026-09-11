@@ -1,0 +1,215 @@
+// arrowdf.nv — the conversion to and from a data frame's columns,
+// declared as an interface rather than taken as a dependency.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHY THIS IS TWO TRAITS AND NOT A DEPENDENCY ON dataframe-nv.  The
+// plan's note for this package is "the interchange format behind
+// dataframe-nv".  A format that is BEHIND a consumer cannot depend on
+// it: the edge dataframe-nv eventually wants — from its columns to
+// these buffers — would close a cycle, and the two packages could never
+// both be published.  So the conversion crosses the boundary as a pair
+// of traits this package declares and the other side implements, and
+// arrow-nv's dependency list stays at one entry.
+//
+// The same shape serves a second caller nobody has written yet.  A
+// database's result set, a CSV reader's typed records and a data
+// frame's columns are all "a named, typed, nullable sequence", and any
+// of them can implement `ArrowColumnSink` to receive an Arrow batch or
+// `ArrowColumnSource` to produce one.  Naming the interface rather than
+// the package is what makes that true.
+//
+// **THE NARROWING IS THE HONEST PART.**  Arrow has thirty-odd logical
+// types and a data frame has four.  A conversion that pretended
+// otherwise would answer a `Result` that fails on the eleventh column
+// of somebody's file with no warning beforehand — so `cell_kind_of`
+// answers the narrowing for a TYPE, before any data is read, and
+// `ArrowCellUnsupported` is a value rather than an error.  A caller
+// checks its schema once and knows which columns it can take; the ones
+// it cannot are named in `unsupported_columns`, and the decision to
+// drop them, refuse the file or read them as text is the caller's.
+//
+// WHAT IS LOST, AND WHERE IT IS SAID.  Four narrowings destroy
+// information and all four are reported by `narrowing_of` rather than
+// performed silently:
+//
+//   `UInt64` past 2^63     no `Int` holds it; the bit pattern is kept
+//                          and the sign is wrong.
+//   `Decimal128/256`       no exact `Float`; scaling loses digits.
+//   `Timestamp(Nano)`      past 2262, no `Int` nanosecond holds it.
+//   a dictionary column    resolved to its VALUES, so a column that
+//                          was four bytes a row becomes a string a row.
+//
+// A caller that wants none of that reads the arrays directly with
+// `arrowcol`; this module is the convenience for the caller that wants
+// a data frame and should be told what it costs.
+
+// The four cell kinds a data frame has, plus the answer for a column
+// that has none.
+//
+// Declared here, not imported: taking dataframe-nv for one enum of four
+// variants would be the cycle this module's header is about.  The names
+// match what `DfKind` means and not what it is spelled, because the
+// bridge is a function on the other side either way.
+pub enum ArrowCellKind
+    ArrowCellFloat
+    ArrowCellInt
+    ArrowCellBool
+    ArrowCellStr
+    // No data frame cell holds this column — a nested type, a union, a
+    // decimal, an interval, a fixed-size binary.  A VALUE and not a
+    // fault: see this module's header.
+    ArrowCellUnsupported
+
+// What a narrowing costs, when it costs something.
+pub enum ArrowNarrowing
+    // Nothing is lost.
+    ArrowNarrowExact
+    // The value is kept and its sign is not — an unsigned 64-bit value
+    // past 2^63.
+    ArrowNarrowSignLost
+    // Digits are lost — a decimal scaled into a float.
+    ArrowNarrowPrecisionLost
+    // Values outside a range are lost — nanoseconds past 2262.
+    ArrowNarrowRangeLost
+    // The column grows: a dictionary's indices become its values.
+    ArrowNarrowExpanded
+    // Nothing is converted at all.
+    ArrowNarrowRefused
+
+// Which data frame cell kind a column of this Arrow type narrows to.
+//
+// A pure function of the TYPE, so a caller checks a schema before it
+// reads a byte.
+//
+// ```novo
+// use arrowdf
+//
+// fn main() [io]
+//     match arrowdf.cell_kind_of(ArrowUtf8)
+//         ArrowCellStr => println("text")
+//         _            => println("something else")
+// ```
+pub fn cell_kind_of(t: ArrowType) -> ArrowCellKind
+    todo("arrow-nv.arrowdf.cell_kind_of")
+
+// What converting a column of this type costs.
+pub fn narrowing_of(t: ArrowType) -> ArrowNarrowing
+    todo("arrow-nv.arrowdf.narrowing_of")
+
+// The narrowing's name, for a warning a caller shows once per file.
+pub fn narrowing_name(n: ArrowNarrowing) -> Str
+    todo("arrow-nv.arrowdf.narrowing_name")
+
+// The names of every column of a schema that no data frame cell holds.
+//
+// The call a caller makes before it starts, so the refusal is one line
+// naming four columns rather than a failure on the eleventh.
+pub fn unsupported_columns(s: ArrowSchema) -> [Str]
+    todo("arrow-nv.arrowdf.unsupported_columns")
+
+// Every column whose conversion loses something, with what it loses.
+pub fn lossy_columns(s: ArrowSchema) -> [Str]
+    todo("arrow-nv.arrowdf.lossy_columns")
+
+// ── The sink: Arrow in, a frame out ─────────────────────────────────
+
+// What a data frame — or a result set, or anything else columnar —
+// implements to receive an Arrow batch.
+//
+// FOUR PUT METHODS, ONE PER CELL KIND, and each takes the values and
+// the presence mask as two lists rather than a list of optionals.  That
+// is the shape a columnar consumer already has (dataframe-nv's
+// `with_nulls` takes exactly this pair), it is what an Arrow validity
+// bitmap decodes to, and a list of `?Float` would allocate per element
+// on a column where almost nothing is null.
+//
+// No effect parameter: filling a frame performs nothing, and a sink
+// that wanted to write to a file would be doing something this
+// interface is not for.
+pub trait ArrowColumnSink
+    // A float column and which of its rows are present.
+    fn put_floats(self, name: Str, values: [Float], present: [Bool]) -> Self
+    // An integer column.
+    fn put_ints(self, name: Str, values: [Int], present: [Bool]) -> Self
+    // A boolean column.
+    fn put_bools(self, name: Str, values: [Bool], present: [Bool]) -> Self
+    // A text column.  A dictionary-encoded column arrives here already
+    // resolved, which is the `ArrowNarrowExpanded` cost.
+    fn put_strs(self, name: Str, values: [Str], present: [Bool]) -> Self
+    // A column this sink is not being given, and why.  Called for every
+    // name in `unsupported_columns`, so a sink can record the hole
+    // rather than silently have a narrower frame than the file.
+    fn skip_column(self, name: Str, reason: Str) -> Self
+
+// Drain one column of a batch into a sink.
+//
+// The type parameter is closed by the `sink` argument, which is a
+// value — so this is the shape that works today, and a version that
+// took only a projection function would not.
+pub fn drain_column<S: ArrowColumnSink>(body: Bytes, b: ArrowBatch, name: Str,
+                                        sink: S) -> Result<S, ArrowFault>
+    todo("arrow-nv.arrowdf.drain_column")
+
+// Drain every column of a batch into a sink, in schema order.
+pub fn drain_batch<S: ArrowColumnSink>(body: Bytes, b: ArrowBatch, sink: S) -> Result<S, ArrowFault>
+    todo("arrow-nv.arrowdf.drain_batch")
+
+// Drain the columns a projection names, in the projection's order.
+pub fn drain_projection<S: ArrowColumnSink>(body: Bytes, b: ArrowBatch, names: [Str],
+                                            sink: S) -> Result<S, ArrowFault>
+    todo("arrow-nv.arrowdf.drain_projection")
+
+// ── The source: a frame in, Arrow out ───────────────────────────────
+
+// What a data frame implements to be written as an Arrow batch.
+//
+// Read-only and index-addressed, because that is what every columnar
+// container already offers and because a source that had to build a
+// list of columns first would allocate the whole frame again.
+pub trait ArrowColumnSource
+    fn column_count(self) -> Int
+    fn row_count(self) -> Int
+    fn column_name(self, i: Int) -> Str
+    fn column_kind(self, i: Int) -> ArrowCellKind
+    // Which rows of column `i` are present.
+    fn column_present(self, i: Int) -> [Bool]
+    fn floats_at(self, i: Int) -> [Float]
+    fn ints_at(self, i: Int) -> [Int]
+    fn bools_at(self, i: Int) -> [Bool]
+    fn strs_at(self, i: Int) -> [Str]
+
+// The Arrow schema a source's columns describe.
+//
+// `Float64`, `Int64`, `Bool` and `Utf8`, every field nullable, because
+// a source that reports a present mask has said that nulls are possible
+// and a non-nullable field that turns out to have one is a file no
+// reader accepts.
+pub fn schema_of_source<S: ArrowColumnSource>(src: S) -> Result<ArrowSchema, ArrowFault>
+    todo("arrow-nv.arrowdf.schema_of_source")
+
+// How many bytes a batch built from this source's rows will need.
+//
+// Answered before anything is built, so a caller sizes one buffer.
+pub fn body_bound_of_source<S: ArrowColumnSource>(src: S) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowdf.body_bound_of_source")
+
+// Build a batch from a source, writing its body into the caller's
+// cursor.
+//
+// Two answers, because the batch is spans into the body this call just
+// wrote and the caller needs both: the batch to hand to
+// `arrowwrite.write_batch`, and the count so it knows how much of its
+// buffer is live.
+pub fn batch_of_source<S: ArrowColumnSource>(src: S,
+                                             mut dst: Cursor) -> Result<(ArrowBatch, Int), ArrowFault>
+    todo("arrow-nv.arrowdf.batch_of_source")
+
+// The rows `[from, from + count)` of a source as one batch.
+//
+// The chunking a writer wants: a frame with ten million rows becomes a
+// stream of batches, and choosing the batch size is the caller's
+// because it is a memory decision.
+pub fn batch_of_source_slice<S: ArrowColumnSource>(src: S, from: Int, count: Int,
+                                                   mut dst: Cursor) -> Result<(ArrowBatch, Int), ArrowFault>
+    todo("arrow-nv.arrowdf.batch_of_source_slice")

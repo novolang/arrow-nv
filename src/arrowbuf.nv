@@ -1,0 +1,260 @@
+// arrowbuf.nv — a buffer as a SPAN into bytes the caller owns, and the
+// bit and offset arithmetic that reads one.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A BUFFER IS TWO INTEGERS.  Arrow's whole argument is that a column is
+// already laid out the way a machine wants to read it, so copying it
+// into a novo-lang list to answer a question about it would spend
+// exactly what the format exists to save.  `ArrowBuffer` is therefore
+// `(start, len)` into ONE body the caller holds — the `Bytes` that came
+// off a socket, out of a file, or out of a mapped page — and every
+// accessor in this package takes that body beside the array.
+//
+// The consequences are worth being explicit about, because they are the
+// package's shape:
+//
+//   - This package never allocates on a read.  A million-row batch
+//     reaches a caller as one `Bytes` it already had plus a tree of
+//     small structs.
+//   - `arrowcol.slice` is free.  A slice shares its parent's buffers
+//     and changes only `offset` and `length`.
+//   - There is nothing to map and nothing to free, which is why a
+//     `core` budget is honest here rather than arranged.
+//
+// EVERY BIT INDEX IS `array.offset + i`, NEVER `i`.  A validity bitmap
+// is bit-addressed from the START OF THE ARRAY, and an Arrow array
+// carries an `offset` into buffers it shares with its parent.  So
+// element 0 of a sliced array is bit `offset` of the bitmap, and a
+// reader that indexes the bitmap directly reads its parent's nulls.
+// That is why `is_valid` takes the ARRAY and not the buffer: there is
+// no spelling of this accessor that lets a caller forget the offset.
+//
+// ALIGNMENT AND PADDING ARE THE PRODUCER'S PROBLEM, NOT THE READER'S.
+// The IPC specification requires every buffer to start on an 8-byte
+// boundary and pads message metadata to 8, with 64 recommended for the
+// buffers themselves.  A reader that REFUSED a misaligned buffer would
+// refuse real files, so `check_alignment` is a separate call a producer
+// can run and a reader need not; the accessors read unaligned.
+
+// A span into the body the caller owns.
+//
+// Not a `Bytes` of its own: two integers, so an array of thirty
+// buffers is thirty pairs and not thirty allocations, and so a slice
+// costs nothing.  Boxed rather than `@value` because
+// `arrowcol.ArrowArray` is boxed and holds a list of these, and a
+// `@value` struct may not be a boxed struct's field.
+pub struct ArrowBuffer
+    // Byte offset into the message body.
+    start: Int
+    // Length in bytes, as the metadata declared it.  This is the
+    // DECLARED length: it may be padded past the data, and for a
+    // validity buffer it may be zero, which means "no nulls" rather
+    // than "no buffer".
+    len: Int
+
+// What a buffer at a given position in an array's buffer list MEANS.
+//
+// The list's positions are fixed by the type, so a role is a function
+// of `(type, index)` and not something the format records.  Naming them
+// is what stops a reader from passing an offsets buffer to a bitmap
+// accessor: the two are both "a buffer" and reading one as the other
+// produces plausible numbers.
+pub enum ArrowBufferRole
+    // One bit per element, LSB first within each byte, `1` meaning
+    // present.  May be length zero, which means every element is
+    // present.
+    ArrowValidityRole
+    // `length + 1` int32 entries.  Element `i` spans
+    // `[offset[i], offset[i+1])`.
+    ArrowOffset32Role
+    // The same with int64 entries.
+    ArrowOffset64Role
+    // The values themselves, at the type's fixed width.
+    ArrowValuesRole
+    // One bit per element, for `Bool`'s values.
+    ArrowBitsRole
+    // One int8 per element: which child of a union holds the value.
+    ArrowTypeIdRole
+    // One int32 per element: where in that child the value is.  Dense
+    // unions only.
+    ArrowUnionOffsetRole
+
+// The roles of an array of this type, in the order the buffers appear.
+//
+// THE LOAD-BEARING TABLE OF THIS MODULE, and the companion to
+// `arrowtype.buffer_count_of`: that one says how many, this one says
+// which.  The empty list for `ArrowNull`, `[ArrowValidityRole,
+// ArrowBitsRole]` for `ArrowBool`, `[ArrowTypeIdRole,
+// ArrowUnionOffsetRole]` for a dense union — no validity, which is the
+// entry a hand-written reader does not have.
+//
+// ```novo
+// use arrowbuf
+// use std.list
+//
+// fn main() [io]
+//     println("${list.len(arrowbuf.layout_of(ArrowUtf8))}")
+// ```
+pub fn layout_of(t: ArrowType) -> [ArrowBufferRole]
+    todo("arrow-nv.arrowbuf.layout_of")
+
+// The role at a position, or a fault when the type has no buffer there.
+pub fn role_at(t: ArrowType, index: Int) -> Result<ArrowBufferRole, ArrowFault>
+    todo("arrow-nv.arrowbuf.role_at")
+
+// The role's name, for a fault report and for a dump.
+pub fn role_name(r: ArrowBufferRole) -> Str
+    todo("arrow-nv.arrowbuf.role_name")
+
+// A span.
+pub fn buffer(start: Int, len: Int) -> ArrowBuffer
+    todo("arrow-nv.arrowbuf.buffer")
+
+// The empty span, which is what an absent validity bitmap is.
+pub fn no_buffer() -> ArrowBuffer
+    todo("arrow-nv.arrowbuf.no_buffer")
+
+// One past the last byte of a span.
+pub fn end_of(b: ArrowBuffer) -> Int
+    todo("arrow-nv.arrowbuf.end_of")
+
+// Whether the body is long enough to hold this span.
+pub fn fits(body: Bytes, b: ArrowBuffer) -> Bool
+    todo("arrow-nv.arrowbuf.fits")
+
+// The alignment the IPC specification requires of a buffer's start —
+// eight bytes.
+pub fn alignment() -> Int
+    todo("arrow-nv.arrowbuf.alignment")
+
+// The alignment the specification RECOMMENDS — sixty-four, so a buffer
+// starts on a cache line and on every vector width in use.
+pub fn preferred_alignment() -> Int
+    todo("arrow-nv.arrowbuf.preferred_alignment")
+
+// `n` rounded up to the next multiple of `alignment()`.
+//
+// What a writer adds after every buffer, and what `arrowwrite` sizes
+// with.
+pub fn padded_len(n: Int) -> Int
+    todo("arrow-nv.arrowbuf.padded_len")
+
+// How many bytes a validity bitmap for `n` elements needs — `n`
+// bits rounded up to a byte and then to the alignment.
+pub fn bitmap_bytes(n: Int) -> Int
+    todo("arrow-nv.arrowbuf.bitmap_bytes")
+
+// Whether every buffer in a list starts on the required boundary.
+//
+// A PRODUCER'S check, not a reader's: the accessors here read unaligned
+// and a reader that refused a misaligned file would refuse files that
+// exist.  Run it in a writer's test suite and in a tool that audits
+// somebody else's output.
+pub fn check_alignment(buffers: [ArrowBuffer]) -> [ArrowFault]
+    todo("arrow-nv.arrowbuf.check_alignment")
+
+// ── Bitmaps ─────────────────────────────────────────────────────────
+
+// Bit `i` of a bitmap buffer, counted from the buffer's own start.
+//
+// The RAW accessor, and the one a caller should almost never reach for:
+// an element's bit is `array.offset + i`, and `arrowcol.is_valid` is
+// the call that knows that.  Published because a writer building a
+// bitmap has no array yet.
+pub fn bit_at(body: Bytes, b: ArrowBuffer, i: Int) -> Bool
+    todo("arrow-nv.arrowbuf.bit_at")
+
+// Bit `i` with a default for a zero-length buffer.
+//
+// An absent validity bitmap means "all present", and an absent `Bool`
+// values buffer is a fault — so the two callers want different answers
+// for the same missing buffer, and the default is an argument rather
+// than a rule.
+pub fn bit_at_or(body: Bytes, b: ArrowBuffer, i: Int, absent: Bool) -> Bool
+    todo("arrow-nv.arrowbuf.bit_at_or")
+
+// How many bits are set in `[from, from + count)`.
+//
+// What a null count is recomputed from when a producer's declared count
+// is not trusted, and what `arrowcol.slice` cannot do cheaply — which
+// is why a sliced array's null count is `-1` ("unknown") rather than a
+// wrong number.
+pub fn count_set(body: Bytes, b: ArrowBuffer, from: Int, count: Int) -> Int
+    todo("arrow-nv.arrowbuf.count_set")
+
+// The byte a run of eight bits sits in, and the bit's position in it.
+//
+// Published because the LSB-first order inside a byte is the detail
+// that makes two implementations disagree, and a caller writing a
+// bitmap by hand should use this rather than re-derive it.
+pub fn bit_position(i: Int) -> (Int, Int)
+    todo("arrow-nv.arrowbuf.bit_position")
+
+// A bitmap byte with bit `i` set, for a writer.
+pub fn with_bit(byte_value: Int, i: Int, set: Bool) -> Int
+    todo("arrow-nv.arrowbuf.with_bit")
+
+// ── Offsets ─────────────────────────────────────────────────────────
+
+// Entry `i` of a 32-bit offsets buffer.
+pub fn offset32_at(body: Bytes, b: ArrowBuffer, i: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowbuf.offset32_at")
+
+// Entry `i` of a 64-bit offsets buffer.
+pub fn offset64_at(body: Bytes, b: ArrowBuffer, i: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowbuf.offset64_at")
+
+// The span element `i` of a variable-width array covers, in the values
+// buffer.
+//
+// `large` picks the entry width, and the two are not interchangeable:
+// reading a 64-bit offsets buffer as 32-bit answers the low half of
+// every entry, which for a small column is the right answer for element
+// zero and wrong for every element after it.  That is the failure mode
+// this argument exists to make impossible to reach by accident.
+pub fn value_span(body: Bytes, offsets: ArrowBuffer, i: Int,
+                  large: Bool) -> Result<ArrowBuffer, ArrowFault>
+    todo("arrow-nv.arrowbuf.value_span")
+
+// Whether an offsets buffer ascends and ends within the values buffer.
+//
+// Checked on demand, not on every read: an offsets buffer is `n + 1`
+// entries and validating it per element would make a random access
+// linear.  A reader that does not trust its producer runs this once
+// per column.
+pub fn check_offsets(body: Bytes, offsets: ArrowBuffer, values_len: Int, length: Int, offset: Int,
+                     large: Bool) -> [ArrowFault]
+    todo("arrow-nv.arrowbuf.check_offsets")
+
+// ── Fixed-width values ──────────────────────────────────────────────
+
+// The byte span of element `i` of a fixed-width values buffer.
+//
+// `bits` is the type's width from `arrowtype.fixed_width_bits`, and it
+// is in bits rather than bytes so that `ArrowBool` has an answer here
+// instead of a special case at every call site.
+pub fn element_span(values: ArrowBuffer, i: Int, bits: Int) -> Result<ArrowBuffer, ArrowFault>
+    todo("arrow-nv.arrowbuf.element_span")
+
+// A signed little-endian integer of `width` bytes at element `i`.
+pub fn int_at(body: Bytes, values: ArrowBuffer, i: Int, width: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowbuf.int_at")
+
+// An unsigned little-endian integer of `width` bytes at element `i`.
+//
+// Separate from `int_at` because novo-lang's `Int` is 64-bit signed and
+// a `UInt64` whose top bit is set has no faithful `Int`: this answers
+// the two's-complement bit pattern and `ArrowDecimalOutOfRange` is
+// NOT raised, which is stated here so a caller reading identifiers
+// knows to compare them as bit patterns.
+pub fn uint_at(body: Bytes, values: ArrowBuffer, i: Int, width: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowbuf.uint_at")
+
+// An IEEE 754 float of `width` bytes (2, 4 or 8) at element `i`,
+// widened to novo-lang's `Float`.
+//
+// `Float16` widening is exact; `Float32` widening is exact; neither
+// direction back is, and `arrowwrite` says what it rounds.
+pub fn float_at(body: Bytes, values: ArrowBuffer, i: Int, width: Int) -> Result<Float, ArrowFault>
+    todo("arrow-nv.arrowbuf.float_at")

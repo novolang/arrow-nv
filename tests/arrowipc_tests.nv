@@ -1,0 +1,228 @@
+// arrowipc_tests.nv — the framing constants, the continuation marker
+// that was added in 0.15, the footer arithmetic, and the narrowing a
+// data frame conversion costs.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: arrow-nv.<module>.<fn>`.
+//
+// THE CONSTANTS ARE THE SPECIFICATION'S OWN.  `ARROW1\0\0`, the
+// `0xFFFFFFFF` continuation marker, the 8-byte required and 64-byte
+// recommended alignment, the epoch, and `Date64`'s multiple-of-a-day
+// rule are all written in the Arrow columnar and IPC specifications
+// rather than chosen here, so a port that disagrees with one of these
+// disagrees with every Arrow implementation there is.
+
+use std.test
+use std.list
+use arrowipc
+use arrowbuf
+use arrowtime
+use arrowdf
+use arrowtype
+
+@test
+fn test_the_file_magic_is_eight_bytes_and_both_ends_carry_it() [io]
+    let m = arrowipc.file_magic()
+
+    test.case("ARROW1 and two padding zeros — eight bytes, so the body stays aligned")
+    test.assert(bytes.len(m) == 8)
+    test.assert(bytes.byte_at(m, 0) == Some(65))
+    test.assert(bytes.byte_at(m, 5) == Some(49))
+    test.assert(bytes.byte_at(m, 6) == Some(0))
+    test.assert(bytes.byte_at(m, 7) == Some(0))
+
+@test
+fn test_a_message_without_the_continuation_marker_is_refused_by_default() [io]
+    // A pre-0.15 message: a bare int32 metadata length, no marker.
+    let legacy = bytes.from_byte_list([8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+
+    test.case("the default reader refuses it rather than reading the length as a marker")
+    match arrowipc.read_header(legacy, 0, false)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and the legacy framing is a decision a caller makes by name")
+    let r = arrowipc.reader(ArrowStreamFormat)
+    let l = arrowipc.with_legacy(r)
+    test.assert(l.legacy)
+    test.assert(r.legacy == false)
+
+@test
+fn test_the_limit_crosses_the_interface_before_anything_is_allocated() [io]
+    let r = arrowipc.reader(ArrowStreamFormat)
+
+    test.case("there are two limits, because metadata and body fail differently")
+    test.assert(r.metadata_limit > 0)
+    test.assert(r.body_limit > 0)
+    test.assert(r.metadata_limit == arrowipc.default_metadata_limit())
+
+    test.case("and both are the caller's to raise, deliberately")
+    let tight = arrowipc.with_body_limit(arrowipc.with_metadata_limit(r, 4096), 65536)
+    test.assert(tight.metadata_limit == 4096)
+    test.assert(tight.body_limit == 65536)
+
+    test.case("a header claiming more than the limit is refused")
+    // A message whose declared metadata length is two gigabytes.
+    let huge = bytes.from_byte_list([255, 255, 255, 255, 0, 0, 0, 128])
+    match arrowipc.read_header(huge, 0, false)
+        Ok(h)  => test.assert(h.metadata_len > tight.metadata_limit)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_footer_is_found_from_the_last_ten_bytes() [io]
+    // <footer length = 96><ARROW1\0\0>
+    let tail = bytes.from_byte_list([96, 0, 0, 0, 65, 82, 82, 79, 87, 49, 0, 0])
+
+    test.case("a file of 1024 bytes puts its footer at 1024 - 8 - 4 - 96")
+    match arrowipc.footer_position(tail, 1024)
+        Ok(at) => test.assert(at == 916)
+        Err(_) => test.assert(false)
+
+    test.case("a tail whose magic is wrong is not an Arrow file")
+    let bad = bytes.from_byte_list([96, 0, 0, 0, 80, 75, 3, 4, 0, 0, 0, 0])
+    match arrowipc.footer_position(bad, 1024)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and a footer length larger than the file is refused rather than seeked to")
+    match arrowipc.footer_position(tail, 32)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_alignment_is_eight_required_and_sixty_four_recommended() [io]
+    test.case("the specification requires eight")
+    test.assert(arrowbuf.alignment() == 8)
+
+    test.case("and recommends sixty-four, which is a cache line")
+    test.assert(arrowbuf.preferred_alignment() == 64)
+
+    test.case("padding rounds up to the required boundary")
+    test.assert(arrowbuf.padded_len(0) == 0)
+    test.assert(arrowbuf.padded_len(1) == 8)
+    test.assert(arrowbuf.padded_len(8) == 8)
+    test.assert(arrowbuf.padded_len(9) == 16)
+
+    test.case("a bitmap for n elements is n bits rounded to a byte and then padded")
+    test.assert(arrowbuf.bitmap_bytes(0) == 0)
+    test.assert(arrowbuf.bitmap_bytes(1) == 8)
+    test.assert(arrowbuf.bitmap_bytes(64) == 8)
+    test.assert(arrowbuf.bitmap_bytes(65) == 16)
+
+@test
+fn test_the_temporal_units_are_the_four_powers_of_a_thousand() [io]
+    test.assert(arrowtime.ticks_per_second(ArrowSecond) == 1)
+    test.assert(arrowtime.ticks_per_second(ArrowMilli) == 1000)
+    test.assert(arrowtime.ticks_per_second(ArrowMicro) == 1000000)
+    test.assert(arrowtime.ticks_per_second(ArrowNano) == 1000000000)
+
+    test.case("widening is exact")
+    test.assert(arrowtime.convert(5, ArrowSecond, ArrowMilli) == 5000)
+    test.assert(arrowtime.convert_is_exact(5, ArrowSecond, ArrowMilli))
+
+    test.case("narrowing truncates toward negative infinity, so dates before 1970 hold")
+    test.assert(arrowtime.convert(0 - 1, ArrowMilli, ArrowSecond) == 0 - 1)
+    test.assert(arrowtime.convert(1500, ArrowMilli, ArrowSecond) == 1)
+
+    test.case("and it says when it lost something")
+    test.assert(arrowtime.convert_is_exact(1500, ArrowMilli, ArrowSecond) == false)
+    test.assert(arrowtime.convert_is_exact(2000, ArrowMilli, ArrowSecond))
+
+@test
+fn test_the_epoch_is_1970_01_01_and_date64_is_a_multiple_of_a_day() [io]
+    let e = arrowtime.epoch()
+    test.assert(e.year == 1970)
+    test.assert(e.month == 1)
+    test.assert(e.day == 1)
+
+    test.case("day zero is the epoch")
+    match arrowtime.date32_to_civil(0)
+        Ok(d)  =>
+            test.assert(d.year == 1970)
+            test.assert(d.day == 1)
+        Err(_) => test.assert(false)
+
+    test.case("and the round trip is the identity")
+    match arrowtime.date32_to_civil(19723)
+        Err(_) => test.assert(false)
+        Ok(d)  =>
+            match arrowtime.civil_to_date32(d)
+                Ok(n)  => test.assert(n == 19723)
+                Err(_) => test.assert(false)
+
+    test.case("Date64 must be an exact multiple of 86_400_000")
+    test.assert(arrowtime.check_date64(0))
+    test.assert(arrowtime.check_date64(86400000))
+    test.assert(arrowtime.check_date64(86400001) == false)
+
+    test.case("a reader truncates rather than refusing, because those files exist")
+    match arrowtime.date64_to_civil(86400001)
+        Ok(d)  => test.assert(d.day == 2)
+        Err(_) => test.assert(false)
+
+@test
+fn test_an_empty_zone_is_a_wall_clock_and_utc_is_not() [io]
+    test.assert(arrowtime.is_wall_clock(ArrowTimestamp(ArrowMicro, "")))
+    test.assert(arrowtime.is_wall_clock(ArrowTimestamp(ArrowMicro, "UTC")) == false)
+    test.assert(arrowtime.is_wall_clock(ArrowTimestamp(ArrowNano, "Europe/Oslo")) == false)
+
+    test.case("the zone is carried unread")
+    test.assert(arrowtime.zone_of(ArrowTimestamp(ArrowMicro, "Europe/Oslo")) == "Europe/Oslo")
+    test.assert(arrowtime.zone_of(ArrowTimestamp(ArrowMicro, "")) == "")
+
+    test.case("and a type with no unit is refused rather than defaulted")
+    match arrowtime.unit_of(ArrowUtf8)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_narrowing_to_four_cell_kinds_is_answered_before_any_data_is_read() [io]
+    test.assert_eq_str(arrowdf.narrowing_name(arrowdf.narrowing_of(ArrowInt64)),
+                       arrowdf.narrowing_name(ArrowNarrowExact))
+
+    test.case("the four that map cleanly")
+    match arrowdf.cell_kind_of(ArrowFloat64)
+        ArrowCellFloat => test.assert(true)
+        _              => test.assert(false)
+    match arrowdf.cell_kind_of(ArrowInt32)
+        ArrowCellInt => test.assert(true)
+        _            => test.assert(false)
+    match arrowdf.cell_kind_of(ArrowBool)
+        ArrowCellBool => test.assert(true)
+        _             => test.assert(false)
+    match arrowdf.cell_kind_of(ArrowUtf8)
+        ArrowCellStr => test.assert(true)
+        _            => test.assert(false)
+
+    test.case("and the ones no data frame cell holds — a value, not an error")
+    match arrowdf.cell_kind_of(ArrowStruct)
+        ArrowCellUnsupported => test.assert(true)
+        _                    => test.assert(false)
+    match arrowdf.cell_kind_of(ArrowUnion(ArrowDenseUnion))
+        ArrowCellUnsupported => test.assert(true)
+        _                    => test.assert(false)
+
+    test.case("a UInt64 keeps its bits and loses its sign, and says so")
+    match arrowdf.narrowing_of(ArrowUInt64)
+        ArrowNarrowSignLost => test.assert(true)
+        _                   => test.assert(false)
+
+    test.case("a decimal loses digits")
+    match arrowdf.narrowing_of(ArrowDecimal128(38, 10))
+        ArrowNarrowPrecisionLost => test.assert(true)
+        _                        => test.assert(false)
+
+@test
+fn test_a_schemas_unsupported_columns_are_named_before_the_first_row() [io]
+    let s = arrowtype.schema([arrowtype.field("a", ArrowInt64, false),
+                              arrowtype.nested_field("b", ArrowStruct, true,
+                                  [arrowtype.field("x", ArrowInt64, true)]),
+                              arrowtype.field("c", ArrowUtf8, true)])
+
+    test.case("one column of three cannot be a data frame cell")
+    let bad = arrowdf.unsupported_columns(s)
+    test.assert(list.len(bad) == 1)
+    test.assert(bad[0] == "b")
+
+    test.case("and nothing here loses precision, so the lossy list is empty")
+    test.assert(list.len(arrowdf.lossy_columns(s)) == 0)

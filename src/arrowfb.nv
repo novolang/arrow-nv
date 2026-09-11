@@ -1,0 +1,175 @@
+// arrowfb.nv — the FlatBuffers subset Arrow's IPC metadata needs, and
+// nothing else.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A SUBSET, DECLARED, RATHER THAN A FLATBUFFERS LIBRARY.  Arrow's
+// metadata is a FlatBuffers message, and FlatBuffers as a format has a
+// schema language, a code generator, unions, structs-in-tables, nested
+// buffers, a verifier and a JSON bridge.  Arrow's `Message.fbs` uses a
+// small corner of it: tables with scalar and offset fields, vectors of
+// offsets and of scalars, strings, one enum per field, and structs
+// (`FieldNode`, `Buffer`) which are fixed inline records.  That corner
+// is this module, and it is one module rather than a dependency for
+// three reasons worth writing down:
+//
+//   1. A FlatBuffers port is a compiler, and a compiler is a package.
+//      `flatbuffers-nv` is a row somebody may want; it is not this row,
+//      and taking a dependency on a package that does not exist is not
+//      a design, it is a wish.
+//   2. What Arrow needs is READ-ONLY over a buffer the caller holds,
+//      which is fifteen functions of pointer arithmetic.  A generated
+//      reader would be the same arithmetic with a schema compiler in
+//      front of it.
+//   3. The subset is checkable.  Every function here is one line of the
+//      FlatBuffers binary specification, and a reviewer can compare
+//      them against it without reading a generated file.
+//
+// THE THING THAT MAKES FLATBUFFERS READABLE WITHOUT A PARSER is the
+// vtable: a table's first field is a SIGNED offset BACKWARD to a vtable
+// that lists, per field id, the byte offset of that field within the
+// table — or zero, meaning the field is absent and the reader uses the
+// schema's default.  So reading field 4 of a table is two indirections
+// and a bounds check, and a field a newer writer added is a vtable
+// entry an older reader never looks at.  That is why an Arrow file
+// written by a newer Arrow still reads here, and it is why
+// `table_field_offset` answering zero is normal rather than a fault.
+//
+// EVERYTHING IS LITTLE-ENDIAN, always, regardless of the schema's
+// `endianness` — that field describes the BUFFERS, not the metadata.
+// A reader that byte-swapped the metadata on a big-endian stream would
+// read a big-endian file's metadata backwards.
+
+// Where a table, a vector or a string starts, as a byte offset into the
+// caller's own metadata bytes.
+//
+// A bare `Int` would be indistinguishable from a field VALUE that is
+// itself an integer, and the two are read differently — an offset field
+// holds a RELATIVE offset that must be added to its own position, and
+// forgetting the addition reads whatever is at the start of the buffer.
+// Naming the type is what makes that mistake refuse to compile.
+pub struct ArrowFbPos
+    at: Int
+
+// The root table of a FlatBuffers buffer.
+//
+// The first four bytes are a relative offset to the root table.  An
+// Arrow IPC message's metadata block starts here.
+pub fn root_table(meta: Bytes) -> Result<ArrowFbPos, ArrowFault>
+    todo("arrow-nv.arrowfb.root_table")
+
+// The root table of a SIZE-PREFIXED buffer.
+//
+// Arrow's file footer is size-prefixed and its stream messages are not,
+// so the two spellings exist and a reader that used one for both reads
+// the size as the root offset.
+pub fn root_table_size_prefixed(meta: Bytes) -> Result<ArrowFbPos, ArrowFault>
+    todo("arrow-nv.arrowfb.root_table_size_prefixed")
+
+// The offset of field `id` within a table, or `0` when the field is
+// absent.
+//
+// ZERO IS NOT AN ERROR.  An absent field means "the schema's default",
+// which for Arrow is `0`, `false` or an empty vector depending on the
+// field — so every accessor below takes the default it should answer
+// rather than returning an optional the caller would have to unwrap
+// fifty times per message.
+pub fn table_field_offset(meta: Bytes, t: ArrowFbPos, id: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowfb.table_field_offset")
+
+// A `bool` field, or `absent` when the field is not in the vtable.
+pub fn field_bool(meta: Bytes, t: ArrowFbPos, id: Int, absent: Bool) -> Result<Bool, ArrowFault>
+    todo("arrow-nv.arrowfb.field_bool")
+
+// An `int8`, `int16`, `int32` or `int64` field of `width` bytes,
+// sign-extended.
+pub fn field_int(meta: Bytes, t: ArrowFbPos, id: Int, width: Int,
+                 absent: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowfb.field_int")
+
+// A `uint` field of `width` bytes, zero-extended.
+pub fn field_uint(meta: Bytes, t: ArrowFbPos, id: Int, width: Int,
+                  absent: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowfb.field_uint")
+
+// A nested table field's position, and whether it was present.
+//
+// The `Bool` is the whole answer for an optional table — `Field.type`
+// is present on every field and `Field.dictionary` on almost none — and
+// an `?ArrowFbPos` would be the same fact in a shape that costs an
+// allocation per absent field on a schema with a thousand of them.
+pub fn field_table(meta: Bytes, t: ArrowFbPos, id: Int) -> Result<(ArrowFbPos, Bool), ArrowFault>
+    todo("arrow-nv.arrowfb.field_table")
+
+// A string field, copied out.
+//
+// Copied and not a span, because a schema's field names are the one
+// part of an Arrow message a caller keeps: a batch is read and
+// discarded, the schema outlives it.
+pub fn field_str(meta: Bytes, t: ArrowFbPos, id: Int) -> Result<Str, ArrowFault>
+    todo("arrow-nv.arrowfb.field_str")
+
+// How many elements a vector field has, `0` when the field is absent.
+pub fn field_vector_len(meta: Bytes, t: ArrowFbPos, id: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowfb.field_vector_len")
+
+// Element `i` of a vector of table offsets.
+pub fn vector_table_at(meta: Bytes, t: ArrowFbPos, id: Int,
+                       i: Int) -> Result<ArrowFbPos, ArrowFault>
+    todo("arrow-nv.arrowfb.vector_table_at")
+
+// Element `i` of a vector of strings.
+pub fn vector_str_at(meta: Bytes, t: ArrowFbPos, id: Int, i: Int) -> Result<Str, ArrowFault>
+    todo("arrow-nv.arrowfb.vector_str_at")
+
+// Element `i` of a vector of scalars of `width` bytes.
+pub fn vector_int_at(meta: Bytes, t: ArrowFbPos, id: Int, i: Int,
+                     width: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowfb.vector_int_at")
+
+// Element `i` of a vector of fixed-size STRUCTS of `size` bytes, as the
+// byte offset where that element starts.
+//
+// `FieldNode` (two int64s) and `Buffer` (two int64s) are structs and not
+// tables: they are inline, contiguous and have no vtable, which is what
+// lets a batch with ten thousand buffers carry its metadata in eighty
+// kilobytes instead of megabytes.  A reader that treated them as tables
+// dereferences the first int64 as an offset and lands anywhere.
+pub fn vector_struct_at(meta: Bytes, t: ArrowFbPos, id: Int, i: Int,
+                        size: Int) -> Result<ArrowFbPos, ArrowFault>
+    todo("arrow-nv.arrowfb.vector_struct_at")
+
+// A field of a fixed-size struct, at a byte offset within it.
+pub fn struct_int(meta: Bytes, s: ArrowFbPos, at: Int, width: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowfb.struct_int")
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// A FlatBuffers builder over a `Cursor` the caller sized.
+//
+// FlatBuffers is written BACKWARD — a table's fields are laid down
+// before the table, and the root offset is written last at the front —
+// which is why a builder is a value with a high-water mark rather than
+// a forward cursor, and why `arrowwrite` sizes the destination from
+// `metadata_bound` before it starts.
+pub struct ArrowFbBuilder
+    // How many bytes have been laid down, counting back from the end of
+    // the caller's buffer.
+    used: Int
+    // The vtables already written, so identical ones are shared — which
+    // is what keeps a batch's metadata small when every field node has
+    // the same shape.
+    vtables: [Int]
+
+// A builder over a destination of `capacity` bytes.
+pub fn builder(capacity: Int) -> ArrowFbBuilder
+    todo("arrow-nv.arrowfb.builder")
+
+// An upper bound on the metadata a message with this many field nodes,
+// buffers and schema fields needs.
+//
+// An upper bound and not the exact size: the exact size depends on
+// vtable sharing, and a caller sizing a buffer wants a number it can
+// allocate before it starts rather than after.
+pub fn metadata_bound(nodes: Int, buffers: Int, fields: Int) -> Int
+    todo("arrow-nv.arrowfb.metadata_bound")

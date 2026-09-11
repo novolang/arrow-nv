@@ -1,0 +1,234 @@
+// arrowfault.nv — why a schema, a batch or a stream was refused, and
+// where.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A FAULT NAMES THREE PLACES, because an Arrow fault is almost never
+// where it is noticed.  A record batch is a flat list of buffers
+// re-associated with a tree of fields, so "buffer 11 is four bytes
+// short" is useless on its own and "field `orders.items.price`,
+// validity buffer, at body offset 4096, wanted 512 bytes and the body
+// has 240" is a report somebody can act on.  `ArrowWhere` carries the
+// field path, the buffer's role and the byte offset, and every variant
+// below that can name a position carries one.
+//
+// The faults split into three kinds and the split is worth stating,
+// because a caller reacts to them differently:
+//
+//   INCOMPLETE   — the bytes are fine so far and there are not enough
+//                  of them yet.  A feed-and-drain reader answers this
+//                  by asking for more, and `is_incomplete` is how a
+//                  caller tells "feed me" from "give up".
+//   CORRUPT      — the bytes contradict the format.  Retrying will not
+//                  help and neither will more input.
+//   UNSUPPORTED  — the bytes are valid Arrow that this package does
+//                  not read.  A separate kind on purpose: a consumer
+//                  that treats a run-end-encoded column as corruption
+//                  reports a bug against the producer, and the producer
+//                  is right.
+
+// Where in a stream, a schema and a body a fault was found.
+//
+// Three coordinates rather than one, and each answers a different
+// question: `message` says which message of the stream, `path` says
+// which field of the schema, and `at` says which byte of the body.  A
+// reader that knew only the byte offset would make its user do the
+// re-association this package exists to do.
+pub struct ArrowWhere
+    // Which IPC message, counting from zero over the whole stream.
+    // `-1` when the fault is in a value the caller built rather than in
+    // something read.
+    message: Int
+    // The field, dotted from the schema's root — `orders.items.price`.
+    // Empty for a fault that is not about a field.
+    path: Str
+    // The buffer's index within the message's flat buffer list, or `-1`.
+    // The flat index is what the IPC metadata actually carries, so a
+    // report that named only the path could not be checked against a
+    // dump of the message.
+    buffer: Int
+    // The byte offset into the message body, or `-1`.
+    at: Int
+
+// A position with no field and no buffer — for a fault in the framing
+// rather than in a column.
+pub fn at_byte(message: Int, at: Int) -> ArrowWhere
+    todo("arrow-nv.arrowfault.at_byte")
+
+// A position inside one field's one buffer.
+pub fn at_buffer(message: Int, path: Str, buffer: Int, at: Int) -> ArrowWhere
+    todo("arrow-nv.arrowfault.at_buffer")
+
+// A position that names only a field — for a schema fault, where there
+// is no body yet.
+pub fn at_field(path: Str) -> ArrowWhere
+    todo("arrow-nv.arrowfault.at_field")
+
+// The position for a value the caller built rather than read.
+pub fn nowhere() -> ArrowWhere
+    todo("arrow-nv.arrowfault.nowhere")
+
+// Which of the three kinds a fault is.
+pub enum ArrowFaultKind
+    // Valid so far, and short.  Feed more.
+    ArrowIncomplete
+    // The bytes contradict the format.
+    ArrowCorrupt
+    // Valid Arrow this package does not read.
+    ArrowUnsupported
+
+// Why a schema, an array, a message or a write was refused.
+pub enum ArrowFault
+    // The body ends before a buffer the metadata described.  The most
+    // common fault in a truncated download, and the one a streaming
+    // reader answers by asking for more bytes.
+    ArrowShortBody(want: Int, have: Int, at: ArrowWhere)
+    // A message's metadata claims a length the frame does not carry.
+    ArrowShortMetadata(want: Int, have: Int, at: ArrowWhere)
+    // The four-byte continuation marker that opens an encapsulated
+    // message is not `0xFFFFFFFF`.  Arrow 0.15 introduced it and a
+    // reader that skips the check silently reads a length as a header.
+    ArrowBadContinuation(saw: Int, at: ArrowWhere)
+    // The file format's `ARROW1` magic is missing at the head or the
+    // foot.
+    ArrowBadMagic(at: ArrowWhere)
+    // The footer's length field points outside the file.
+    ArrowFooterNotFound(at: ArrowWhere)
+    // A metadata version this package does not read.  V4 and V5 are
+    // read; V1 to V3 predate the encapsulated-message framing.
+    ArrowVersionUnsupported(version: Int, at: ArrowWhere)
+    // The schema declares an endianness that is not the reader's.
+    // Arrow's buffers are raw little-endian words, so a big-endian
+    // stream is not readable by byte-swapping the metadata alone.
+    ArrowEndianMismatch(at: ArrowWhere)
+    // A type code in the schema that is not in this package's set.
+    ArrowUnknownType(code: Int, at: ArrowWhere)
+    // A type that IS in the spec and is not read here — the view
+    // layouts, run-end encoding, and the two tensor message kinds.
+    // Named separately from corruption on purpose.
+    ArrowTypeUnsupported(name: Str, at: ArrowWhere)
+    // A field's child count does not match what its type requires — a
+    // `List` with two children, a `Struct` with none where the batch
+    // says otherwise, a `Map` whose child is not a two-field struct.
+    ArrowChildCountWrong(want: Int, got: Int, at: ArrowWhere)
+    // The number of buffers the message carries does not match the
+    // number the schema's pre-order walk requires.  The single most
+    // common producer bug, because the walk order is a convention the
+    // format never writes down.
+    ArrowBufferCountWrong(want: Int, got: Int, at: ArrowWhere)
+    // The number of field nodes does not match the walk either.
+    ArrowNodeCountWrong(want: Int, got: Int, at: ArrowWhere)
+    // An offsets buffer that does not ascend.  A variable-width column
+    // whose offsets go backwards yields a negative length, and a reader
+    // that does not check hands a caller a slice of another column.
+    ArrowOffsetsNotAscending(index: Int, previous: Int, saw: Int, at: ArrowWhere)
+    // An offsets buffer whose last entry is past the values buffer.
+    ArrowOffsetPastEnd(index: Int, offset: Int, values_len: Int, at: ArrowWhere)
+    // A length or a null count below zero.
+    ArrowNegativeLength(saw: Int, at: ArrowWhere)
+    // An element index outside `[0, length)` of the array as sliced.
+    ArrowIndexOutOfRange(index: Int, length: Int, at: ArrowWhere)
+    // A dictionary-encoded field whose dictionary has not been seen.
+    // A stream may carry the batch before the dictionary only if the
+    // dictionary is a delta, so this is a real fault rather than a
+    // reordering to tolerate.
+    ArrowDictionaryMissing(id: Int, at: ArrowWhere)
+    // A dictionary whose value type is not the one the field declared.
+    ArrowDictionaryTypeWrong(id: Int, at: ArrowWhere)
+    // A dictionary index outside the dictionary.
+    ArrowDictionaryIndexOutOfRange(index: Int, size: Int, at: ArrowWhere)
+    // A union type id that the field's type-id list does not contain.
+    ArrowUnionTypeIdUnknown(type_id: Int, at: ArrowWhere)
+    // A decimal whose declared precision cannot hold its width, or a
+    // scale outside `[0, precision]`.
+    ArrowDecimalOutOfRange(precision: Int, scale: Int, at: ArrowWhere)
+    // A `Utf8` value whose bytes are not UTF-8.  Checked on demand
+    // rather than on read: validating every string in a batch nobody
+    // reads is the cost the columnar format exists to avoid.
+    ArrowNotUtf8(index: Int, at: ArrowWhere)
+    // A `FixedSizeBinary` or `FixedSizeList` whose width is not
+    // positive.
+    ArrowBadFixedWidth(width: Int, at: ArrowWhere)
+    // Two fields of one struct, or two schema-level metadata keys, with
+    // the same name.  Arrow permits duplicate field names and every
+    // consumer that looks a column up by name breaks on them, so the
+    // check is here and `arrowtype.field_index` is the reason.
+    ArrowDuplicateName(name: Str, at: ArrowWhere)
+    // A message arrived where the stream's grammar does not allow it —
+    // a record batch before the schema, a second schema, anything after
+    // the end-of-stream marker.
+    ArrowUnexpectedMessage(saw: Str, wanted: Str, at: ArrowWhere)
+    // A message longer than the limit the reader was given.  The limit
+    // is the caller's, because a header can claim a length no machine
+    // has room for and the number must cross the interface before
+    // anything is allocated.
+    ArrowMessageTooLarge(want: Int, limit: Int, at: ArrowWhere)
+    // The destination cursor has less room than the write needs.
+    // Nothing is written when this is answered.
+    ArrowWriteBufferTooSmall(want: Int, have: Int, at: ArrowWhere)
+    // A caller built an array whose buffer list does not match its own
+    // type's layout.  Answered by `arrowcol.validate`, never by a read.
+    ArrowLayoutMismatch(want: Int, got: Int, at: ArrowWhere)
+
+// The standard `Error` implementation, so a refused batch is reported
+// by anything that reports errors.
+//
+// ```novo
+// use arrowfault
+//
+// fn main() [io]
+//     let f = arrowfault.short_body(512, 240, arrowfault.nowhere())
+//     println(f.message())
+// ```
+impl Error for ArrowFault
+    // The one-line report: what was wrong, and the three coordinates.
+    // The field path is the half that matters — a byte offset into a
+    // body nobody has a dump of is not actionable, and
+    // `orders.items.price` is.
+    fn message(self) -> Str
+        todo("arrow-nv.arrowfault.ArrowFault.message")
+
+// A short body, built.
+pub fn short_body(want: Int, have: Int, at: ArrowWhere) -> ArrowFault
+    todo("arrow-nv.arrowfault.short_body")
+
+// Which of the three kinds this fault is.
+//
+// The classification is fixed per variant and is not a guess: a caller
+// that pumps a stream feeds more on `ArrowIncomplete`, reports the
+// producer on `ArrowCorrupt`, and reports itself on
+// `ArrowUnsupported`.
+pub fn kind_of(f: ArrowFault) -> ArrowFaultKind
+    todo("arrow-nv.arrowfault.kind_of")
+
+// Whether more bytes could still make this succeed.
+pub fn is_incomplete(f: ArrowFault) -> Bool
+    todo("arrow-nv.arrowfault.is_incomplete")
+
+// Whether the bytes contradict the format.
+pub fn is_corrupt(f: ArrowFault) -> Bool
+    todo("arrow-nv.arrowfault.is_corrupt")
+
+// Where the fault was found.
+pub fn where_of(f: ArrowFault) -> ArrowWhere
+    todo("arrow-nv.arrowfault.where_of")
+
+// The position as one line — `message 3, orders.items.price, buffer 11,
+// byte 4096` — with the absent coordinates left out rather than printed
+// as `-1`.
+pub fn where_text(w: ArrowWhere) -> Str
+    todo("arrow-nv.arrowfault.where_text")
+
+// The kind's name, for a log line that groups faults.
+pub fn kind_name(k: ArrowFaultKind) -> Str
+    todo("arrow-nv.arrowfault.kind_name")
+
+// A fault re-pointed at a field, for a caller that caught one from a
+// child array and knows the parent's name.
+//
+// A child array does not know its own path — it is reached through its
+// parent — so the path is assembled on the way out rather than carried
+// down, which is also what keeps `ArrowArray` free of a name field it
+// would have to keep in step with the schema.
+pub fn under(f: ArrowFault, parent: Str) -> ArrowFault
+    todo("arrow-nv.arrowfault.under")

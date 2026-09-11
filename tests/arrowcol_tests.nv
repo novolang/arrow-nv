@@ -1,0 +1,227 @@
+// arrowcol_tests.nv — the offset that every reader gets wrong once, the
+// slice that costs nothing, and the pre-order walk the format never
+// writes down.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: arrow-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE FOUR MISTAKES.  A validity bit read at `i` instead
+// of `offset + i`; a null count carried through a slice; a `Bool`
+// column read a byte at a time; a buffer walk that visits a struct's
+// children in the wrong place.  Each of those produces plausible
+// numbers and no error, which is why they are the suite.
+
+use std.test
+use std.list
+use arrowcol
+use arrowbuf
+use arrowtype
+
+// A validity bitmap for sixteen elements where the first eight are
+// present and the second eight alternate.  Byte 0 is 0xFF; byte 1 is
+// 0b01010101 = 0x55, so of elements 8..15 the even ones are present.
+fn bitmap_bytes() -> Bytes
+    bytes.from_byte_list([255, 85])
+
+@test
+fn test_a_validity_bit_is_read_at_offset_plus_i_and_not_at_i() [io]
+    let body = bitmap_bytes()
+    let v = arrowbuf.buffer(0, 2)
+
+    test.case("the raw accessor reads the buffer's own bits")
+    test.assert(arrowbuf.bit_at(body, v, 0))
+    test.assert(arrowbuf.bit_at(body, v, 8))
+    test.assert(arrowbuf.bit_at(body, v, 9) == false)
+
+    test.case("an array with offset 8 reads element 0 at BIT 8")
+    let a = arrowcol.array(ArrowInt8, 8, 0 - 1, [v, arrowbuf.buffer(2, 8)])
+    let sliced = ArrowArray { data_type: a.data_type, length: 8,
+                              null_count: 0 - 1, offset: 8,
+                              buffers: a.buffers, children: [],
+                              dictionary_id: 0 - 1 }
+    match arrowcol.is_valid(body, sliced, 0)
+        Ok(ok) => test.assert(ok)
+        Err(_) => test.assert(false)
+
+    test.case("and element 1 at BIT 9, which the bitmap says is absent")
+    match arrowcol.is_valid(body, sliced, 1)
+        Ok(ok) => test.assert(ok == false)
+        Err(_) => test.assert(false)
+
+    test.case("is_null is the same answer, negated, so a call site cannot lose the not")
+    match arrowcol.is_null(body, sliced, 1)
+        Ok(n)  => test.assert(n)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_zero_length_validity_buffer_means_every_element_is_present() [io]
+    let body = bitmap_bytes()
+    let a = arrowcol.array(ArrowInt8, 4, 0,
+                           [arrowbuf.no_buffer(), arrowbuf.buffer(0, 4)])
+
+    test.case("an absent bitmap is all present, not all null")
+    match arrowcol.is_valid(body, a, 0)
+        Ok(ok) => test.assert(ok)
+        Err(_) => test.assert(false)
+    match arrowcol.is_valid(body, a, 3)
+        Ok(ok) => test.assert(ok)
+        Err(_) => test.assert(false)
+
+    test.case("and the raw accessor takes the default as an argument for that reason")
+    test.assert(arrowbuf.bit_at_or(body, arrowbuf.no_buffer(), 0, true))
+    test.assert(arrowbuf.bit_at_or(body, arrowbuf.no_buffer(), 0, false) == false)
+
+@test
+fn test_a_slice_shares_its_buffers_and_forgets_the_null_count() [io]
+    let body = bitmap_bytes()
+    let v = arrowbuf.buffer(0, 2)
+    let d = arrowbuf.buffer(2, 16)
+    let a = arrowcol.array(ArrowInt8, 16, 4, [v, d])
+
+    match arrowcol.slice(a, 4, 8)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.case("the buffers are the SAME spans — nothing was copied")
+            test.assert(list.len(s.buffers) == 2)
+            test.assert(s.buffers[0].start == v.start)
+            test.assert(s.buffers[0].len == v.len)
+            test.assert(s.buffers[1].start == d.start)
+
+            test.case("only the offset and the length moved")
+            test.assert(s.offset == 4)
+            test.assert(s.length == 8)
+
+            test.case("and the null count is -1: recomputing it would be a scan")
+            test.assert(s.null_count == 0 - 1)
+
+    test.case("a slice past the end is refused rather than clamped")
+    match arrowcol.slice(a, 12, 8)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("recount_nulls is the call that costs, and it is the caller's")
+    match arrowcol.recount_nulls(body, a)
+        Ok(n)  => test.assert(n >= 0)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_offsets_of_a_variable_width_column_must_ascend() [io]
+    // Three strings: "ab", "cde", "" — offsets 0, 2, 5, 5.
+    let body = bytes.from_byte_list([0, 0, 0, 0, 2, 0, 0, 0, 5, 0, 0, 0, 5, 0, 0, 0,
+                              97, 98, 99, 100, 101])
+    let offs = arrowbuf.buffer(0, 16)
+
+    test.case("element 1 spans [2, 5)")
+    match arrowbuf.value_span(body, offs, 1, false)
+        Ok(s)  =>
+            test.assert(s.start == 2)
+            test.assert(s.len == 3)
+        Err(_) => test.assert(false)
+
+    test.case("element 2 is empty, which is not the same as null")
+    match arrowbuf.value_span(body, offs, 2, false)
+        Ok(s)  => test.assert(s.len == 0)
+        Err(_) => test.assert(false)
+
+    test.case("a well-formed offsets buffer reports nothing")
+    test.assert(list.len(arrowbuf.check_offsets(body, offs, 5, 3, 0, false)) == 0)
+
+    test.case("reading 32-bit offsets as 64-bit is a different answer, not an error")
+    match arrowbuf.value_span(body, offs, 0, true)
+        Ok(s)  => test.assert(s.start == 0)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_bool_column_is_bits_and_a_byte_wise_read_is_off_by_eight() [io]
+    // 0b00001101 = 13: elements 0, 2 and 3 true.
+    let body = bytes.from_byte_list([255, 13])
+    let a = arrowcol.array(ArrowBool, 8, 0,
+                           [arrowbuf.buffer(0, 1), arrowbuf.buffer(1, 1)])
+
+    test.case("eight booleans live in ONE byte")
+    match arrowcol.bool_at(body, a, 0)
+        Ok(v)  => test.assert(v)
+        Err(_) => test.assert(false)
+    match arrowcol.bool_at(body, a, 1)
+        Ok(v)  => test.assert(v == false)
+        Err(_) => test.assert(false)
+    match arrowcol.bool_at(body, a, 3)
+        Ok(v)  => test.assert(v)
+        Err(_) => test.assert(false)
+
+    test.case("and the bit position is LSB first, which is the half two ports disagree on")
+    let p = arrowbuf.bit_position(9)
+    test.assert(p.0 == 1)
+    test.assert(p.1 == 1)
+
+@test
+fn test_the_walk_is_pre_order_and_a_struct_contributes_one_buffer() [io]
+    let inner = arrowtype.field("item", ArrowUtf8, true)
+    let lst = arrowtype.nested_field("b", ArrowList, true, [inner])
+    let s = arrowtype.schema([arrowtype.field("a", ArrowInt64, false), lst])
+
+    let a_arr = arrowcol.array(ArrowInt64, 4, 0,
+                               [arrowbuf.buffer(0, 1), arrowbuf.buffer(8, 32)])
+    let item = arrowcol.array(ArrowUtf8, 6, 0,
+                              [arrowbuf.buffer(40, 1), arrowbuf.buffer(48, 28),
+                               arrowbuf.buffer(80, 18)])
+    let b_arr = arrowcol.nested_array(ArrowList, 4, 0,
+                                      [arrowbuf.buffer(104, 1),
+                                       arrowbuf.buffer(112, 20)],
+                                       [item])
+    let b = arrowcol.batch(s, [a_arr, b_arr], 4)
+
+    test.case("three nodes, a then b then b's child")
+    let nodes = arrowcol.flatten_nodes(b)
+    test.assert(list.len(nodes) == 3)
+    test.assert(nodes[0].length == 4)
+    test.assert(nodes[2].length == 6)
+
+    test.case("seven buffers, in the same walk, each node's in layout order")
+    test.assert(list.len(arrowcol.flatten_buffers(b)) == 7)
+
+    test.case("and the paths name them, which is what a fault reports")
+    let paths = arrowcol.node_paths(b)
+    test.assert(paths[2] == "b.item")
+
+    test.case("body_reach is the end of the furthest buffer")
+    test.assert(arrowcol.body_reach(b) == 132)
+
+@test
+fn test_a_batch_whose_column_length_is_not_its_row_count_is_refused() [io]
+    let body = bytes.from_byte_list([255, 0, 0, 0, 0, 0, 0, 0])
+    let s = arrowtype.schema([arrowtype.field("a", ArrowInt64, false)])
+    let short = arrowcol.array(ArrowInt64, 3, 0,
+                               [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8)])
+    let b = arrowcol.batch(s, [short], 4)
+
+    test.case("the row count is the message's and the column disagrees")
+    test.assert(list.len(arrowcol.validate_batch(body, b)) > 0)
+    test.assert(arrowcol.batch_ok(body, b) == false)
+
+    test.case("a buffer past the end of the body is a fault, not a short read")
+    let past = arrowcol.array(ArrowInt64, 4, 0,
+                              [arrowbuf.no_buffer(), arrowbuf.buffer(0, 32)])
+    test.assert(list.len(arrowcol.validate(body, past, "a")) > 0)
+
+@test
+fn test_a_column_is_found_by_name_and_a_projection_keeps_the_callers_order() [io]
+    let s = arrowtype.schema([arrowtype.field("a", ArrowInt64, false),
+                              arrowtype.field("b", ArrowInt64, false)])
+    let one = arrowcol.array(ArrowInt64, 1, 0,
+                             [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8)])
+    let two = arrowcol.array(ArrowInt64, 1, 0,
+                             [arrowbuf.no_buffer(), arrowbuf.buffer(8, 8)])
+    let b = arrowcol.batch(s, [one, two], 1)
+
+    test.case("a column that is not there names itself")
+    match arrowcol.column(b, "missing")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and a projection answers the caller's order, not the schema's")
+    match arrowcol.project(b, ["b", "a"])
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(list.len(p.columns) == 2)
+            test.assert(p.columns[0].buffers[1].start == 8)

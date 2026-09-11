@@ -1,0 +1,254 @@
+// arrowwrite_tests.nv — the sizing that has to be answerable BEFORE a
+// byte is written, the writer's refusal to write half a message, and
+// the fault vocabulary.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: arrow-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE CONTRACT A CALLER PLANS AGAINST.  A `core` package
+// does not choose an allocation strategy, so every writer takes a
+// cursor the caller sized — which only works if the size is answerable
+// first.  These assert that it is, that a write which does not fit
+// writes nothing, and that a fault says which of the three kinds it is.
+
+use std.test
+use std.list
+use arrowwrite
+use arrowtype
+use arrowcol
+use arrowbuf
+use arrowfault
+use arrowfb
+use arrowipc
+
+fn one_column_schema() -> ArrowSchema
+    arrowtype.schema([arrowtype.field("n", ArrowInt64, false)])
+
+fn one_column_batch() -> ArrowBatch
+    let a = arrowcol.array(ArrowInt64, 4, 0,
+                           [arrowbuf.no_buffer(), arrowbuf.buffer(0, 32)])
+    arrowcol.batch(one_column_schema(), [a], 4)
+
+@test
+fn test_every_size_is_answerable_before_anything_is_written() [io]
+    let s = one_column_schema()
+    let b = one_column_batch()
+
+    test.case("a schema message has a bound")
+    test.assert(arrowwrite.schema_message_bound(s) > 0)
+
+    test.case("metadata and body are two numbers, because a caller writes them differently")
+    test.assert(arrowwrite.metadata_bound(b) > 0)
+    test.assert(arrowwrite.body_bound(b) >= 32)
+
+    test.case("the body size is EXACT — padding is arithmetic, not a guess")
+    test.assert(arrowwrite.body_bound(b) == arrowbuf.padded_len(32))
+
+    test.case("and the whole message is at least the two together")
+    test.assert(arrowwrite.message_bound(b) >= arrowwrite.body_bound(b))
+
+    test.case("a file footer's bound grows with the blocks it indexes")
+    test.assert(arrowwrite.footer_bound(s, 0, 10) > arrowwrite.footer_bound(s, 0, 1))
+
+    test.case("the flatbuffers bound is over nodes, buffers and fields")
+    test.assert(arrowfb.metadata_bound(3, 7, 2) > 0)
+
+@test
+fn test_a_writer_records_where_each_message_went() [io]
+    let w = arrowwrite.writer(ArrowFileFormat, one_column_schema())
+
+    test.case("nothing written yet, and no blocks")
+    test.assert(w.written == 0)
+    test.assert(list.len(w.blocks) == 0)
+    test.assert(w.schema_written == false)
+
+    test.case("the file format opens with the magic and the stream format does not")
+    let buf = bytes.zeros(4096)
+    var c = bytes.cursor_le(buf)
+    match arrowwrite.write_prologue(w, c)
+        Ok(step) => test.assert(step.1 == 8)
+        Err(_)   => test.assert(false)
+
+    let sw = arrowwrite.writer(ArrowStreamFormat, one_column_schema())
+    var c2 = bytes.cursor_le(bytes.zeros(4096))
+    match arrowwrite.write_prologue(sw, c2)
+        Ok(step) => test.assert(step.1 == 0)
+        Err(_)   => test.assert(false)
+
+@test
+fn test_a_write_that_does_not_fit_writes_nothing() [io]
+    let w = arrowwrite.writer(ArrowStreamFormat, one_column_schema())
+    let b = one_column_batch()
+    let body = bytes.zeros(32)
+
+    test.case("a cursor with no room refuses rather than truncating")
+    var tiny = bytes.cursor_le(bytes.zeros(4))
+    match arrowwrite.write_batch(w, b, body, tiny)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert(arrowfault.is_corrupt(f) == false)
+            test.assert(arrowfault.is_incomplete(f) == false)
+
+    test.case("and a cursor sized from message_bound does not")
+    var ok = bytes.cursor_le(bytes.zeros(arrowwrite.message_bound(b)))
+    match arrowwrite.write_batch(w, b, body, ok)
+        Ok(step) => test.assert(step.1 > 0)
+        Err(_)   => test.assert(false)
+
+@test
+fn test_the_buffer_builders_produce_the_layouts_the_readers_expect() [io]
+    test.case("a validity bitmap is one bit per flag, padded")
+    var c = bytes.cursor_le(bytes.zeros(64))
+    match arrowwrite.write_validity([true, false, true, true], c)
+        Ok(n)  => test.assert(n == arrowbuf.bitmap_bytes(4))
+        Err(_) => test.assert(false)
+
+    test.case("a Bool values buffer is the same shape, which is why it is a separate call")
+    var c2 = bytes.cursor_le(bytes.zeros(64))
+    match arrowwrite.write_bits([true, false, true, true], c2)
+        Ok(n)  => test.assert(n == arrowbuf.bitmap_bytes(4))
+        Err(_) => test.assert(false)
+
+    test.case("an offsets buffer is length + 1 entries, the first zero")
+    var c3 = bytes.cursor_le(bytes.zeros(64))
+    match arrowwrite.write_offsets32([2, 3, 0], c3)
+        Ok(n)  => test.assert(n >= 16)
+        Err(_) => test.assert(false)
+
+    test.case("64-bit offsets are twice the width")
+    var c4 = bytes.cursor_le(bytes.zeros(64))
+    match arrowwrite.write_offsets64([2, 3, 0], c4)
+        Ok(n)  => test.assert(n >= 32)
+        Err(_) => test.assert(false)
+
+    test.case("a fixed-width values buffer is bits per element over eight")
+    var c5 = bytes.cursor_le(bytes.zeros(64))
+    match arrowwrite.write_ints([1, 2, 3, 4], 32, c5)
+        Ok(n)  => test.assert(n == 16)
+        Err(_) => test.assert(false)
+
+    test.case("and writing floats at 16 or 32 bits ROUNDS, which the caller chose")
+    var c6 = bytes.cursor_le(bytes.zeros(64))
+    match arrowwrite.write_floats([1.5, 2.5], 32, c6)
+        Ok(n)  => test.assert(n == 8)
+        Err(_) => test.assert(false)
+
+    test.case("padding takes a running count and answers what it added")
+    var c7 = bytes.cursor_le(bytes.zeros(64))
+    match arrowwrite.write_padding(9, c7)
+        Ok(n)  => test.assert(n == 7)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_fault_names_three_places_and_one_of_three_kinds() [io]
+    let w = arrowfault.at_buffer(3, "orders.items.price", 11, 4096)
+
+    test.case("the coordinates are what a reader can act on")
+    test.assert(w.message == 3)
+    test.assert(w.path == "orders.items.price")
+    test.assert(w.buffer == 11)
+    test.assert(w.at == 4096)
+
+    test.case("a framing fault has no field and says so rather than inventing one")
+    let b = arrowfault.at_byte(3, 40)
+    test.assert(b.path == "")
+    test.assert(b.buffer == 0 - 1)
+
+    test.case("a schema fault has no body yet")
+    let f = arrowfault.at_field("orders.items")
+    test.assert(f.at == 0 - 1)
+
+    test.case("and a value the caller built is nowhere")
+    test.assert(arrowfault.nowhere().message == 0 - 1)
+
+    test.case("a short body is INCOMPLETE: more bytes would fix it")
+    let short = arrowfault.short_body(512, 240, w)
+    test.assert(arrowfault.is_incomplete(short))
+    test.assert(arrowfault.is_corrupt(short) == false)
+    match arrowfault.kind_of(short)
+        ArrowIncomplete => test.assert(true)
+        _               => test.assert(false)
+
+    test.case("the kinds have names, so a log can group them")
+    test.assert(arrowfault.kind_name(ArrowCorrupt) != arrowfault.kind_name(ArrowIncomplete))
+
+    test.case("the position renders without printing the absent coordinates as -1")
+    test.assert(arrowfault.where_text(b) != "")
+
+    test.case("where_of answers the position a fault carries")
+    test.assert(arrowfault.where_of(short).path == w.path)
+
+    test.case("and a child's fault is re-pointed on the way out")
+    let under = arrowfault.under(short, "orders")
+    test.assert(arrowfault.where_of(under).path != "")
+
+@test
+fn test_the_flatbuffers_subset_reads_an_absent_field_as_a_default() [io]
+    // A minimal buffer: root offset 4, an empty table with a 4-byte
+    // vtable that declares no fields.
+    let meta = bytes.from_byte_list([4, 0, 0, 0, 4, 0, 4, 0, 4, 0, 0, 0])
+
+    test.case("the root is a relative offset from its own position")
+    match arrowfb.root_table(meta)
+        Ok(p)  => test.assert(p.at >= 0)
+        Err(_) => test.assert(false)
+
+    test.case("a size-prefixed buffer is a DIFFERENT entry point, not a flag")
+    match arrowfb.root_table_size_prefixed(meta)
+        Ok(p)  => test.assert(p.at >= 0)
+        Err(_) => test.assert(true)
+
+    test.case("an absent field's offset is zero, which is normal rather than a fault")
+    let root = ArrowFbPos { at: 4 }
+    match arrowfb.table_field_offset(meta, root, 6)
+        Ok(off) => test.assert(off == 0)
+        Err(_)  => test.assert(false)
+
+    test.case("so every accessor takes the default it should answer")
+    match arrowfb.field_bool(meta, root, 6, true)
+        Ok(v)  => test.assert(v)
+        Err(_) => test.assert(false)
+    match arrowfb.field_int(meta, root, 6, 4, 7)
+        Ok(v)  => test.assert(v == 7)
+        Err(_) => test.assert(false)
+    match arrowfb.field_uint(meta, root, 6, 8, 0)
+        Ok(v)  => test.assert(v == 0)
+        Err(_) => test.assert(false)
+
+    test.case("an absent vector is length zero rather than an error")
+    match arrowfb.field_vector_len(meta, root, 6)
+        Ok(n)  => test.assert(n == 0)
+        Err(_) => test.assert(false)
+
+    test.case("an optional table answers a position AND whether it was there")
+    match arrowfb.field_table(meta, root, 6)
+        Ok(pair) => test.assert(pair.1 == false)
+        Err(_)   => test.assert(false)
+
+    test.case("and the builder knows how much it has laid down")
+    let bld = arrowfb.builder(4096)
+    test.assert(bld.used == 0)
+    test.assert(list.len(bld.vtables) == 0)
+
+@test
+fn test_an_arrow_file_indexes_messages_and_not_columns() [io]
+    let s = one_column_schema()
+    let f = ArrowFooter { schema: s, dictionaries: [],
+                          batches: [ArrowBlock { offset: 8, metadata_len: 200,
+                                                 body_len: 4096 }],
+                          version: 5 }
+
+    test.case("a projection still reads every block — the footer has no column index")
+    match arrowipc.blocks_for(f, ["n"])
+        Ok(bs) => test.assert(list.len(bs) == 1)
+        Err(_) => test.assert(false)
+
+    test.case("what IS answerable is the byte ranges inside one block's body")
+    match arrowipc.ranges_for(f, f.batches[0], ["n"])
+        Ok(rs) => test.assert(list.len(rs) >= 1)
+        Err(_) => test.assert(false)
+
+    test.case("a projection naming a column the schema does not have is refused")
+    match arrowipc.blocks_for(f, ["missing"])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

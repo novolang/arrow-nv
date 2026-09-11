@@ -1,0 +1,358 @@
+// arrowcol.nv — an array over buffers the caller owns, and a record
+// batch as a tree of them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// **THE LOAD-BEARING INTERFACE OF THIS PACKAGE IS `ArrowArray`.**  It
+// is four integers, a list of spans and a list of children, and the
+// fourth integer is the one the design rests on:
+//
+//     data_type   what the buffers mean
+//     length      how many elements THIS array has
+//     null_count  how many of them are null, or -1 for "not known"
+//     offset      where this array starts inside buffers it SHARES
+//     buffers     spans into a body the caller holds
+//     children    the same structure, recursively
+//
+// `offset` is what makes a slice free, and it is what every reader gets
+// wrong once.  A validity bitmap is bit-addressed from the start of the
+// ARRAY, so element `i` of an array with `offset = 1000` is bit `1000 +
+// i` of a bitmap it shares with its parent.  A reader that indexes the
+// bitmap at `i` reads its parent's nulls — plausible values, no error,
+// wrong answers — and this package makes that unwritable by taking the
+// array rather than the buffer in every accessor.  `arrowbuf.bit_at` is
+// the raw spelling and its own comment says not to use it.
+//
+// A RECORD BATCH IS A TREE OF ARRAYS AND A FLAT LIST OF BUFFERS, AND
+// THE ORDER BETWEEN THEM IS A CONVENTION THE FORMAT NEVER WRITES DOWN.
+// The IPC metadata carries `nodes` and `buffers` as two flat lists;
+// re-associating them with the schema is a PRE-ORDER walk — a field,
+// then its children left to right, depth first — and the buffers of
+// each node come in `arrowbuf.layout_of` order.  Every implementation
+// that walked breadth-first, or that emitted a struct's own (empty)
+// values buffer, produces a file that reads as garbage from the first
+// nested column on.  `flatten_nodes` and `flatten_buffers` are that
+// walk, published, so a caller comparing two producers uses the same
+// one this package does.
+//
+// A NULL COUNT OF `-1` MEANS "NOT KNOWN", AND THAT IS DELIBERATE.
+// Slicing cannot recompute a null count without scanning the bitmap,
+// and scanning it would make an O(1) operation O(n) — so a slice
+// answers `-1` and `recount_nulls` is the call that costs what it
+// costs.  An implementation that carried its parent's count through a
+// slice would hand a caller a number larger than the array's length.
+
+use civil
+
+// One column, or one child of one.
+pub struct ArrowArray
+    // What the buffers mean.  For a dictionary-encoded column this is
+    // the INDEX type, not the field's value type — the field carries
+    // that, and `ArrowBatch.dictionaries` carries the values.
+    data_type: ArrowType
+    // How many elements, after `offset`.
+    length: Int
+    // How many of them are null, or `-1` for "not known".
+    null_count: Int
+    // Where this array starts inside buffers it may share.
+    offset: Int
+    // Spans into the body, in `arrowbuf.layout_of(data_type)` order.
+    buffers: [ArrowBuffer]
+    // The children a nested type has.
+    children: [ArrowArray]
+    // The dictionary id when this array holds indices, `-1` otherwise.
+    // Kept here as well as on the field so that an array lifted out of
+    // a batch is still resolvable.
+    dictionary_id: Int
+
+// A dictionary that has been seen on the stream, with the id it answers
+// to.
+pub struct ArrowDictEntry
+    id: Int
+    // The dictionary's VALUES, as an array of the field's value type.
+    values: ArrowArray
+    // The body those values' buffers span.  A dictionary arrives in its
+    // own message with its own body, so it cannot share the batch's.
+    body: Bytes
+
+// One record batch: a schema, one array per top-level field, and the
+// dictionaries in force.
+pub struct ArrowBatch
+    schema: ArrowSchema
+    columns: [ArrowArray]
+    // The row count the message declared.  Not derived from the
+    // columns: a batch of zero columns still has rows, and a producer
+    // whose column lengths disagree with this is caught by `validate`
+    // rather than silently believed.
+    rows: Int
+    // Every dictionary the stream has installed, newest per id.
+    dictionaries: [ArrowDictEntry]
+
+// An array with no children and no dictionary.
+//
+// ```novo
+// use arrowcol
+// use arrowbuf
+//
+// fn main() [io]
+//     let v = arrowbuf.buffer(0, 8)
+//     let d = arrowbuf.buffer(8, 64)
+//     let a = arrowcol.array(ArrowInt64, 8, 0, [v, d])
+//     println("${a.length}")
+// ```
+pub fn array(data_type: ArrowType, length: Int, null_count: Int,
+             buffers: [ArrowBuffer]) -> ArrowArray
+    todo("arrow-nv.arrowcol.array")
+
+// An array with children — a list, a struct, a map or a union.
+pub fn nested_array(data_type: ArrowType, length: Int, null_count: Int, buffers: [ArrowBuffer],
+                    children: [ArrowArray]) -> ArrowArray
+    todo("arrow-nv.arrowcol.nested_array")
+
+// An array of dictionary indices, bound to a dictionary id.
+pub fn dict_array(index_type: ArrowType, length: Int, null_count: Int, buffers: [ArrowBuffer],
+                  id: Int) -> ArrowArray
+    todo("arrow-nv.arrowcol.dict_array")
+
+// A batch.
+pub fn batch(schema: ArrowSchema, columns: [ArrowArray], rows: Int) -> ArrowBatch
+    todo("arrow-nv.arrowcol.batch")
+
+// A batch with the dictionaries a stream has installed.
+pub fn batch_with_dicts(schema: ArrowSchema, columns: [ArrowArray], rows: Int,
+                        dictionaries: [ArrowDictEntry]) -> ArrowBatch
+    todo("arrow-nv.arrowcol.batch_with_dicts")
+
+// ── Slicing, which is the point ─────────────────────────────────────
+
+// `count` elements from `from`, sharing every buffer.
+//
+// O(1) and allocation-free: the buffers are the same spans, the
+// children are sliced the same way, and only `offset`, `length` and
+// `null_count` change.  A projection over a two-gigabyte batch costs a
+// handful of structs, which is the reason a columnar format is worth
+// the metadata.
+//
+// The result's `null_count` is `-1`.  See this module's header.
+pub fn slice(a: ArrowArray, from: Int, count: Int) -> Result<ArrowArray, ArrowFault>
+    todo("arrow-nv.arrowcol.slice")
+
+// Every column of a batch sliced the same way.
+pub fn slice_batch(b: ArrowBatch, from: Int, count: Int) -> Result<ArrowBatch, ArrowFault>
+    todo("arrow-nv.arrowcol.slice_batch")
+
+// The null count, scanning the bitmap when it is not known.
+//
+// Costs one pass over `length` bits.  Called by a caller that needs the
+// number, never by an accessor.
+pub fn recount_nulls(body: Bytes, a: ArrowArray) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowcol.recount_nulls")
+
+// A batch's columns by name, or a fault naming the column.
+pub fn column(b: ArrowBatch, name: Str) -> Result<ArrowArray, ArrowFault>
+    todo("arrow-nv.arrowcol.column")
+
+// The columns a projection names, in the projection's order.
+//
+// The order is the CALLER's, not the schema's, because a projection
+// that reordered to match the file would make `select a, b` and
+// `select b, a` the same call.
+pub fn project(b: ArrowBatch, names: [Str]) -> Result<ArrowBatch, ArrowFault>
+    todo("arrow-nv.arrowcol.project")
+
+// ── Reading one element ─────────────────────────────────────────────
+
+// Whether element `i` is present.
+//
+// THE ACCESSOR THE OFFSET ARGUMENT IS ABOUT.  Reads bit `a.offset + i`
+// of `a.buffers[0]`, and answers `true` when that buffer has length
+// zero — an absent validity bitmap means every element is present, and
+// a reader that treated it as "every element is null" would read an
+// entire non-nullable column as empty.
+pub fn is_valid(body: Bytes, a: ArrowArray, i: Int) -> Result<Bool, ArrowFault>
+    todo("arrow-nv.arrowcol.is_valid")
+
+// Whether element `i` is null — `is_valid` negated, published because
+// the call site usually wants this spelling and `not` at every call
+// site is where a negation gets lost.
+pub fn is_null(body: Bytes, a: ArrowArray, i: Int) -> Result<Bool, ArrowFault>
+    todo("arrow-nv.arrowcol.is_null")
+
+// Element `i` of an integer, temporal or boolean column, as an `Int`.
+//
+// Covers every fixed-width type whose values are integral: the signed
+// and unsigned integers, `Bool` (0 or 1), `Date32`, `Date64`, both
+// `Time` types, `Timestamp` and `Duration`.  A null element answers
+// `0`; `is_valid` is the call that distinguishes, and the pair is two
+// calls rather than one `?Int` so that a caller scanning a column with
+// no nulls does not pay for an optional per element.
+pub fn int_at(body: Bytes, a: ArrowArray, i: Int) -> Result<Int, ArrowFault>
+    todo("arrow-nv.arrowcol.int_at")
+
+// Element `i` of a floating-point column.
+pub fn float_at(body: Bytes, a: ArrowArray, i: Int) -> Result<Float, ArrowFault>
+    todo("arrow-nv.arrowcol.float_at")
+
+// Element `i` of a boolean column.
+pub fn bool_at(body: Bytes, a: ArrowArray, i: Int) -> Result<Bool, ArrowFault>
+    todo("arrow-nv.arrowcol.bool_at")
+
+// The SPAN of element `i` of a `Utf8`, `Binary`, `LargeUtf8`,
+// `LargeBinary` or `FixedSizeBinary` column.
+//
+// A span and not a `Str`: the bytes are in the caller's body and
+// copying them is the caller's decision.  A filter that compares a
+// million strings against one literal compares spans; only the rows
+// that survive are ever materialised.
+pub fn span_at(body: Bytes, a: ArrowArray, i: Int) -> Result<ArrowBuffer, ArrowFault>
+    todo("arrow-nv.arrowcol.span_at")
+
+// Element `i` of a string column, copied out as a `Str`.
+//
+// The convenience over `span_at`, and the one that costs.  UTF-8 is
+// checked HERE and not on read, which is why `ArrowNotUtf8` names an
+// index: validating a whole column nobody reads is the cost the format
+// exists to avoid.
+pub fn str_at(body: Bytes, a: ArrowArray, i: Int) -> Result<Str, ArrowFault>
+    todo("arrow-nv.arrowcol.str_at")
+
+// The raw 16 or 32 bytes of a decimal element, little-endian two's
+// complement.
+//
+// Not a `Float` and not an `Int`: a `Decimal128(38, 10)` does not fit
+// either, and converting would be the quiet data loss a decimal type
+// exists to prevent.  A caller that has bigint-nv scales these; one
+// that does not compares them as bytes.
+pub fn decimal_bytes_at(body: Bytes, a: ArrowArray, i: Int) -> Result<ArrowBuffer, ArrowFault>
+    todo("arrow-nv.arrowcol.decimal_bytes_at")
+
+// ── Reading a nested element ────────────────────────────────────────
+
+// The range of the child array that element `i` of a list covers.
+//
+// Works for `List`, `LargeList`, `FixedSizeList` and `Map`: the first
+// two read the offsets buffer, `FixedSizeList` multiplies by the width
+// in its type, and a `Map` is a `List` of its entries struct.  One
+// function because a caller walking a nested schema should not branch
+// on which of the four it has.
+pub fn child_range(body: Bytes, a: ArrowArray, i: Int) -> Result<(Int, Int), ArrowFault>
+    todo("arrow-nv.arrowcol.child_range")
+
+// Element `i` of a list, as a slice of its child array.
+pub fn list_at(body: Bytes, a: ArrowArray, i: Int) -> Result<ArrowArray, ArrowFault>
+    todo("arrow-nv.arrowcol.list_at")
+
+// A struct's field by index.
+//
+// Every child of a struct is as long as the struct and shares its
+// offset — which is why this is a lookup and not a read, and why a
+// struct column has no values buffer at all.
+pub fn struct_field(a: ArrowArray, index: Int) -> Result<ArrowArray, ArrowFault>
+    todo("arrow-nv.arrowcol.struct_field")
+
+// A map element's key and value arrays, sliced to that element's
+// entries.
+pub fn map_at(body: Bytes, a: ArrowArray, i: Int) -> Result<(ArrowArray, ArrowArray), ArrowFault>
+    todo("arrow-nv.arrowcol.map_at")
+
+// Which child holds element `i` of a union, and where in that child.
+//
+// The two answers are one call because a sparse union's offset IS the
+// element index and a dense union's is a second buffer read: a caller
+// that asked for them separately would have to know the mode, and the
+// mode is what this function is for.
+pub fn union_at(body: Bytes, a: ArrowArray, f: ArrowField, i: Int) -> Result<(Int, Int), ArrowFault>
+    todo("arrow-nv.arrowcol.union_at")
+
+// ── Dictionaries ────────────────────────────────────────────────────
+
+// The dictionary an array's indices resolve against.
+pub fn dictionary_for(b: ArrowBatch, a: ArrowArray) -> Result<ArrowDictEntry, ArrowFault>
+    todo("arrow-nv.arrowcol.dictionary_for")
+
+// Element `i` of a dictionary-encoded column, resolved to a span in the
+// DICTIONARY's body.
+//
+// Two bodies, and the signature says so: the indices are in the batch's
+// body and the values are in the dictionary message's, which arrived
+// earlier and separately.  An implementation that assumed one body
+// reads a dictionary column as whatever happened to be at that offset
+// in the batch.
+pub fn dict_span_at(body: Bytes, b: ArrowBatch, a: ArrowArray,
+                    i: Int) -> Result<ArrowBuffer, ArrowFault>
+    todo("arrow-nv.arrowcol.dict_span_at")
+
+// The same, copied out as a `Str`.
+pub fn dict_str_at(body: Bytes, b: ArrowBatch, a: ArrowArray, i: Int) -> Result<Str, ArrowFault>
+    todo("arrow-nv.arrowcol.dict_str_at")
+
+// A dictionary batch applied to the set in force — a replacement, or a
+// delta appended to what is there.
+//
+// `is_delta` is the message's own flag and the two behave differently
+// enough that a reader which ignored it would silently drop values: a
+// delta APPENDS and the indices in later batches count past the end of
+// the first dictionary.
+pub fn install_dictionary(dicts: [ArrowDictEntry], entry: ArrowDictEntry,
+                          is_delta: Bool) -> [ArrowDictEntry]
+    todo("arrow-nv.arrowcol.install_dictionary")
+
+// ── The pre-order walk ──────────────────────────────────────────────
+
+// Every array in a batch, in the order the IPC metadata's `nodes` list
+// has them.
+//
+// Pre-order, depth first, children left to right.  See this module's
+// header for why this is published rather than internal.
+pub fn flatten_nodes(b: ArrowBatch) -> [ArrowArray]
+    todo("arrow-nv.arrowcol.flatten_nodes")
+
+// Every buffer in a batch, in the order the IPC metadata's `buffers`
+// list has them — the same walk, each node contributing
+// `arrowbuf.layout_of` in order.
+pub fn flatten_buffers(b: ArrowBatch) -> [ArrowBuffer]
+    todo("arrow-nv.arrowcol.flatten_buffers")
+
+// The dotted path of every node of the walk, for a fault report.
+pub fn node_paths(b: ArrowBatch) -> [Str]
+    todo("arrow-nv.arrowcol.node_paths")
+
+// ── Checking ────────────────────────────────────────────────────────
+
+// Every way an array contradicts its own type or its body: a buffer
+// list that is not `layout_of`'s length, a length or null count below
+// zero, a null count past the length, offsets that do not ascend, a
+// span past the end of the body, a child count the type does not allow.
+//
+// Answers every fault rather than the first, and each one carries the
+// path from the root so a caller can see that four of them are the same
+// column.
+pub fn validate(body: Bytes, a: ArrowArray, path: Str) -> [ArrowFault]
+    todo("arrow-nv.arrowcol.validate")
+
+// Every way a batch contradicts its schema — a column count that is not
+// the schema's, a column whose type is not its field's, a column whose
+// length is not `rows`, a dictionary-encoded field with no dictionary
+// installed — plus every array's own faults.
+pub fn validate_batch(body: Bytes, b: ArrowBatch) -> [ArrowFault]
+    todo("arrow-nv.arrowcol.validate_batch")
+
+// Whether a batch passes every check.
+pub fn batch_ok(body: Bytes, b: ArrowBatch) -> Bool
+    todo("arrow-nv.arrowcol.batch_ok")
+
+// How many bytes of the body a batch actually reaches.
+//
+// The end of the furthest buffer, which is what a caller trimming a
+// body to the part a batch needs asks for, and what a writer's test
+// compares against the length it declared.
+pub fn body_reach(b: ArrowBatch) -> Int
+    todo("arrow-nv.arrowcol.body_reach")
+
+// The civil date element `i` of a `Date32` or `Date64` column names.
+//
+// Here rather than in `arrowtime` because the element read and the
+// conversion are one call a caller wants, and the split would make
+// every date read two.  `arrowtime` owns the conversion itself.
+pub fn date_at(body: Bytes, a: ArrowArray, i: Int) -> Result<civil.CivilDate, ArrowFault>
+    todo("arrow-nv.arrowcol.date_at")
