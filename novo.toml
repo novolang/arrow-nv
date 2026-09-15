@@ -1,6 +1,6 @@
 [package]
 name        = "arrow-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The Apache Arrow columnar format as values: the schema with every logical type, the buffer layout per type, a record batch whose buffers are SPANS into one body the caller owns, and the IPC stream and file formats as a feed-and-drain reader and a writer into a caller's cursor.  Nothing is copied on the way in and nothing is performed.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
