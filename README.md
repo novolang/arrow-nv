@@ -232,7 +232,7 @@ implementation against the layout tables.
   still reads here.
 - **A build for a microcontroller.** A schema is a tree of boxed structs
   with strings in it and a batch is a growable list of arrays, so this
-  package makes no device claim.
+  package does not build for a microcontroller with no heap allocator.
 - **Any input or output.** No file is opened, no memory is mapped and no
   clock is read.
 
