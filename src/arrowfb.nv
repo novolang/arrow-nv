@@ -1,51 +1,41 @@
-// arrowfb.nv — the FlatBuffers subset Arrow's IPC metadata needs, and
-// nothing else.
+// arrowfb.nv — the part of the FlatBuffers encoding Arrow's IPC
+// metadata uses, read and written.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// Arrow's metadata is FlatBuffers (Message.fbs, Schema.fbs and File.fbs
+// in the Arrow repository).  Those schemas use tables with scalar and
+// offset fields, vectors of tables, of scalars and of strings, strings,
+// unions as a type field beside a table field, and two fixed-size
+// structs, `FieldNode` and `Buffer`, stored inline.  This module is that
+// part of FlatBuffers and no more: no schema compiler and no verifier.
 //
-// A SUBSET, DECLARED, RATHER THAN A FLATBUFFERS LIBRARY.  Arrow's
-// metadata is a FlatBuffers message, and FlatBuffers as a format has a
-// schema language, a code generator, unions, structs-in-tables, nested
-// buffers, a verifier and a JSON bridge.  Arrow's `Message.fbs` uses a
-// small corner of it: tables with scalar and offset fields, vectors of
-// offsets and of scalars, strings, one enum per field, and structs
-// (`FieldNode`, `Buffer`) which are fixed inline records.  That corner
-// is this module, and it is one module rather than a dependency for
-// three reasons worth writing down:
+// A table starts with a signed offset back to its vtable, which lists,
+// per field id, the byte offset of the field within the table, or zero
+// when the field is absent.  An absent field means the schema's
+// default, which for Arrow is `0`, `false` or an empty vector, so every
+// accessor here takes the default it should answer.  A field that a
+// newer writer added is a vtable entry an older reader never looks at.
 //
-//   1. A FlatBuffers port is a compiler, and a compiler is a package.
-//      `flatbuffers-nv` is a row somebody may want; it is not this row,
-//      and taking a dependency on a package that does not exist is not
-//      a design, it is a wish.
-//   2. What Arrow needs is READ-ONLY over a buffer the caller holds,
-//      which is fifteen functions of pointer arithmetic.  A generated
-//      reader would be the same arithmetic with a schema compiler in
-//      front of it.
-//   3. The subset is checkable.  Every function here is one line of the
-//      FlatBuffers binary specification, and a reviewer can compare
-//      them against it without reading a generated file.
+// An offset field holds an unsigned offset forward from its own
+// position (FlatBuffers binary format, "Tables" and "Vectors").
+// Everything is little-endian, whatever the schema's `endianness` says:
+// that field describes the buffers, not the metadata.
 //
-// THE THING THAT MAKES FLATBUFFERS READABLE WITHOUT A PARSER is the
-// vtable: a table's first field is a SIGNED offset BACKWARD to a vtable
-// that lists, per field id, the byte offset of that field within the
-// table — or zero, meaning the field is absent and the reader uses the
-// schema's default.  So reading field 4 of a table is two indirections
-// and a bounds check, and a field a newer writer added is a vtable
-// entry an older reader never looks at.  That is why an Arrow file
-// written by a newer Arrow still reads here, and it is why
-// `table_field_offset` answering zero is normal rather than a fault.
-//
-// EVERYTHING IS LITTLE-ENDIAN, always, regardless of the schema's
-// `endianness` — that field describes the BUFFERS, not the metadata.
-// A reader that byte-swapped the metadata on a big-endian stream would
-// read a big-endian file's metadata backwards.
+// The writer lays objects down front to back, each after the object
+// that refers to it, and fills in each forward offset once the object
+// it names is written.  Scalars sit at their natural alignment, and a
+// vtable identical to one already written is shared.
+
+use std.bytes
+use std.list
+use std.str
+use arrowfault
 
 // Where a table, a vector or a string starts, as a byte offset into the
 // caller's own metadata bytes.
 //
-// A bare `Int` would be indistinguishable from a field VALUE that is
+// A bare `Int` would be indistinguishable from a field value that is
 // itself an integer, and the two are read differently — an offset field
-// holds a RELATIVE offset that must be added to its own position, and
+// holds a relative offset that must be added to its own position, and
 // forgetting the addition reads whatever is at the start of the buffer.
 // Naming the type is what makes that mistake refuse to compile.
 pub struct ArrowFbPos
@@ -56,41 +46,59 @@ pub struct ArrowFbPos
 // The first four bytes are a relative offset to the root table.  An
 // Arrow IPC message's metadata block starts here.
 pub fn root_table(meta: Bytes) -> Result<ArrowFbPos, ArrowFault>
-    todo("arrow-nv.arrowfb.root_table")
+    Ok(ArrowFbPos { at: read(meta, 0, 4, false)! })
 
-// The root table of a SIZE-PREFIXED buffer.
+// The root table of a size-prefixed buffer.
 //
-// Arrow's file footer is size-prefixed and its stream messages are not,
-// so the two spellings exist and a reader that used one for both reads
-// the size as the root offset.
+// A size-prefixed buffer starts with its own length, and the root offset
+// follows it.  Arrow's messages and its file footer are not
+// size-prefixed; this is here for a caller holding a buffer that is, and
+// a reader that used one spelling for both would read the size as the
+// root offset.
 pub fn root_table_size_prefixed(meta: Bytes) -> Result<ArrowFbPos, ArrowFault>
-    todo("arrow-nv.arrowfb.root_table_size_prefixed")
+    let root = read(meta, 4, 4, false)!
+    let at = 4 + root
+    read(meta, at, 4, true)!
+    Ok(ArrowFbPos { at: at })
 
 // The offset of field `id` within a table, or `0` when the field is
 // absent.
 //
-// ZERO IS NOT AN ERROR.  An absent field means "the schema's default",
+// Zero is not an error.  An absent field means "the schema's default",
 // which for Arrow is `0`, `false` or an empty vector depending on the
 // field — so every accessor below takes the default it should answer
 // rather than returning an optional the caller would have to unwrap
 // fifty times per message.
 pub fn table_field_offset(meta: Bytes, t: ArrowFbPos, id: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowfb.table_field_offset")
+    let vtable = t.at - read(meta, t.at, 4, true)!
+    let size = read(meta, vtable, 2, false)!
+    if 4 + 2 * id + 2 > size
+        return Ok(0)
+    read(meta, vtable + 4 + 2 * id, 2, false)
 
 // A `bool` field, or `absent` when the field is not in the vtable.
 pub fn field_bool(meta: Bytes, t: ArrowFbPos, id: Int, absent: Bool) -> Result<Bool, ArrowFault>
-    todo("arrow-nv.arrowfb.field_bool")
+    let off = table_field_offset(meta, t, id)!
+    if off == 0
+        return Ok(absent)
+    Ok(read(meta, t.at + off, 1, false)! != 0)
 
 // An `int8`, `int16`, `int32` or `int64` field of `width` bytes,
 // sign-extended.
 pub fn field_int(meta: Bytes, t: ArrowFbPos, id: Int, width: Int,
                  absent: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowfb.field_int")
+    let off = table_field_offset(meta, t, id)!
+    if off == 0
+        return Ok(absent)
+    read(meta, t.at + off, width, true)
 
 // A `uint` field of `width` bytes, zero-extended.
 pub fn field_uint(meta: Bytes, t: ArrowFbPos, id: Int, width: Int,
                   absent: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowfb.field_uint")
+    let off = table_field_offset(meta, t, id)!
+    if off == 0
+        return Ok(absent)
+    read(meta, t.at + off, width, false)
 
 // A nested table field's position, and whether it was present.
 //
@@ -99,7 +107,10 @@ pub fn field_uint(meta: Bytes, t: ArrowFbPos, id: Int, width: Int,
 // an `?ArrowFbPos` would be the same fact in a shape that costs an
 // allocation per absent field on a schema with a thousand of them.
 pub fn field_table(meta: Bytes, t: ArrowFbPos, id: Int) -> Result<(ArrowFbPos, Bool), ArrowFault>
-    todo("arrow-nv.arrowfb.field_table")
+    let off = table_field_offset(meta, t, id)!
+    if off == 0
+        return Ok((ArrowFbPos { at: 0 }, false))
+    Ok((follow(meta, t.at + off)!, true))
 
 // A string field, copied out.
 //
@@ -107,27 +118,36 @@ pub fn field_table(meta: Bytes, t: ArrowFbPos, id: Int) -> Result<(ArrowFbPos, B
 // part of an Arrow message a caller keeps: a batch is read and
 // discarded, the schema outlives it.
 pub fn field_str(meta: Bytes, t: ArrowFbPos, id: Int) -> Result<Str, ArrowFault>
-    todo("arrow-nv.arrowfb.field_str")
+    let off = table_field_offset(meta, t, id)!
+    if off == 0
+        return Ok("")
+    string_at(meta, follow(meta, t.at + off)!.at)
 
 // How many elements a vector field has, `0` when the field is absent.
 pub fn field_vector_len(meta: Bytes, t: ArrowFbPos, id: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowfb.field_vector_len")
+    let off = table_field_offset(meta, t, id)!
+    if off == 0
+        return Ok(0)
+    read(meta, follow(meta, t.at + off)!.at, 4, false)
 
 // Element `i` of a vector of table offsets.
 pub fn vector_table_at(meta: Bytes, t: ArrowFbPos, id: Int,
                        i: Int) -> Result<ArrowFbPos, ArrowFault>
-    todo("arrow-nv.arrowfb.vector_table_at")
+    let at = element(meta, t, id, i, 4)!
+    follow(meta, at)
 
 // Element `i` of a vector of strings.
 pub fn vector_str_at(meta: Bytes, t: ArrowFbPos, id: Int, i: Int) -> Result<Str, ArrowFault>
-    todo("arrow-nv.arrowfb.vector_str_at")
+    let at = element(meta, t, id, i, 4)!
+    string_at(meta, follow(meta, at)!.at)
 
 // Element `i` of a vector of scalars of `width` bytes.
 pub fn vector_int_at(meta: Bytes, t: ArrowFbPos, id: Int, i: Int,
                      width: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowfb.vector_int_at")
+    let at = element(meta, t, id, i, width)!
+    read(meta, at, width, true)
 
-// Element `i` of a vector of fixed-size STRUCTS of `size` bytes, as the
+// Element `i` of a vector of fixed-size structs of `size` bytes, as the
 // byte offset where that element starts.
 //
 // `FieldNode` (two int64s) and `Buffer` (two int64s) are structs and not
@@ -137,39 +157,242 @@ pub fn vector_int_at(meta: Bytes, t: ArrowFbPos, id: Int, i: Int,
 // dereferences the first int64 as an offset and lands anywhere.
 pub fn vector_struct_at(meta: Bytes, t: ArrowFbPos, id: Int, i: Int,
                         size: Int) -> Result<ArrowFbPos, ArrowFault>
-    todo("arrow-nv.arrowfb.vector_struct_at")
+    Ok(ArrowFbPos { at: element(meta, t, id, i, size)! })
 
 // A field of a fixed-size struct, at a byte offset within it.
 pub fn struct_int(meta: Bytes, s: ArrowFbPos, at: Int, width: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowfb.struct_int")
+    read(meta, s.at + at, width, true)
 
 // ── Writing ─────────────────────────────────────────────────────────
 
-// A FlatBuffers builder over a `Cursor` the caller sized.
+// What `encode` may lay down, and what it did.
 //
-// FlatBuffers is written BACKWARD — a table's fields are laid down
-// before the table, and the root offset is written last at the front —
-// which is why a builder is a value with a high-water mark rather than
-// a forward cursor, and why `arrowwrite` sizes the destination from
-// `metadata_bound` before it starts.
+// `encode` answers a builder with `used` and `vtables` filled in, so a
+// caller can see how large the buffer came out and how many vtables
+// were shared.
+
 pub struct ArrowFbBuilder
-    // How many bytes have been laid down, counting back from the end of
-    // the caller's buffer.
+    // The most bytes `encode` may lay down.
+    capacity: Int
+    // How many bytes have been laid down.
     used: Int
-    // The vtables already written, so identical ones are shared — which
-    // is what keeps a batch's metadata small when every field node has
-    // the same shape.
+    // Where the vtables already written start, so an identical one is
+    // shared rather than written again.
     vtables: [Int]
 
 // A builder over a destination of `capacity` bytes.
 pub fn builder(capacity: Int) -> ArrowFbBuilder
-    todo("arrow-nv.arrowfb.builder")
+    ArrowFbBuilder { capacity: capacity, used: 0, vtables: [] }
 
-// An upper bound on the metadata a message with this many field nodes,
-// buffers and schema fields needs.
+// An upper bound on the metadata of a record batch message with this
+// many field nodes and buffers and this many top-level fields.
 //
-// An upper bound and not the exact size: the exact size depends on
-// vtable sharing, and a caller sizing a buffer wants a number it can
-// allocate before it starts rather than after.
+// Each node and each buffer is a 16-byte struct, and the tables around
+// them take under 128 bytes.  `arrowwrite.metadata_bound` answers the
+// exact size for a batch in hand.
+
 pub fn metadata_bound(nodes: Int, buffers: Int, fields: Int) -> Int
-    todo("arrow-nv.arrowfb.metadata_bound")
+    // The message table, the record batch table and their vtables take
+    // under 128 bytes; each node and each buffer is one 16-byte struct;
+    // each top-level field may add one variadic count.
+    128 + 16 * nodes + 16 * buffers + 8 * fields
+
+// One field of a table being written: absent, a scalar of `width`
+// bytes, or an offset to an object written after the table.
+pub enum ArrowFbField
+    // Not written, so a reader answers the schema's default.
+    ArrowFbAbsent
+    // An integer of 1, 2, 4 or 8 bytes, little-endian; a `bool` is 1.
+    ArrowFbScalar(value: Int, width: Int)
+    // An offset to a table, a vector or a string.
+    ArrowFbRef(target: ArrowFbObject)
+
+// An object a table field or a vector can refer to.
+pub enum ArrowFbObject
+    // A table.  Field `i` of the list is the field with id `i`.
+    ArrowFbTable(fields: [ArrowFbField])
+    // A vector of tables.
+    ArrowFbTables(items: [ArrowFbObject])
+    // A vector of fixed-size structs, `size` bytes each, already laid
+    // out little-endian in `data`.  The data starts on an eight-byte
+    // boundary.
+    ArrowFbStructs(data: Bytes, size: Int)
+    // A vector of integers of `width` bytes.
+    ArrowFbInts(values: [Int], width: Int)
+    // A vector of strings.
+    ArrowFbStrings(items: [Str])
+    // A string: a length, the bytes and a terminating zero.
+    ArrowFbString(text: Str)
+
+// A FlatBuffers buffer with `root` as its root table, padded to eight
+// bytes.
+//
+// The answer's builder records how many bytes were laid down and where
+// each distinct vtable went.  `ArrowWriteBufferTooSmall` when the result
+// is longer than the builder's capacity.
+//
+// ```novo
+// use arrowfb
+//
+// fn main() [io]
+//     let root = ArrowFbTable([ArrowFbScalar(7, 4)])
+//     match arrowfb.encode(arrowfb.builder(64), root)
+//         Ok(done) => println("${done.0.used}")
+//         Err(e)   => println(e.message())
+// ```
+pub fn encode(b: ArrowFbBuilder, root: ArrowFbObject) -> Result<(ArrowFbBuilder, Bytes), ArrowFault>
+    var out: [Int] = [0, 0, 0, 0]
+    var vtables: [Int] = []
+    let at = write_object(out, vtables, root)
+    patch(out, 0, 4, at)
+    pad_to(out, 8)
+    if list.len(out) > b.capacity
+        return Err(ArrowWriteBufferTooSmall(list.len(out), b.capacity, arrowfault.nowhere()))
+    Ok((ArrowFbBuilder { capacity: b.capacity, used: list.len(out), vtables: vtables },
+        bytes.from_byte_list(out)))
+
+// ── reading, the parts shared above ─────────────────────────────────
+
+// A little-endian integer of `width` bytes at `at`, sign-extended when
+// `signed`.
+fn read(meta: Bytes, at: Int, width: Int, signed: Bool) -> Result<Int, ArrowFault>
+    let n = bytes.len(meta)
+    if at < 0 or at + width > n
+        return Err(ArrowShortMetadata(at + width, n, arrowfault.at_byte(-1, at)))
+    var v = 0
+    for k in 0..width
+        v = v | ((bytes.byte_at(meta, at + k) ?? 0) << (8 * k))
+    if signed and width < 8 and v >= (1 << (8 * width - 1))
+        return Ok(v - (1 << (8 * width)))
+    Ok(v)
+
+// The position an offset field at `at` points to.
+fn follow(meta: Bytes, at: Int) -> Result<ArrowFbPos, ArrowFault>
+    Ok(ArrowFbPos { at: at + read(meta, at, 4, false)! })
+
+fn string_at(meta: Bytes, at: Int) -> Result<Str, ArrowFault>
+    let n = read(meta, at, 4, false)!
+    if at + 4 + n > bytes.len(meta)
+        return Err(ArrowShortMetadata(at + 4 + n, bytes.len(meta), arrowfault.at_byte(-1, at)))
+    Ok(bytes.to_str(bytes.slice(meta, at + 4, at + 4 + n)))
+
+// Where element `i` of the vector field `id` starts, its elements being
+// `size` bytes each.
+fn element(meta: Bytes, t: ArrowFbPos, id: Int, i: Int, size: Int) -> Result<Int, ArrowFault>
+    let n = field_vector_len(meta, t, id)!
+    if i < 0 or i >= n
+        return Err(ArrowIndexOutOfRange(i, n, arrowfault.nowhere()))
+    let off = table_field_offset(meta, t, id)!
+    Ok(follow(meta, t.at + off)!.at + 4 + i * size)
+
+// ── writing, the parts shared above ─────────────────────────────────
+
+fn pad_to(var out: [Int], align: Int)
+    loop
+        if list.len(out) % align == 0
+            break
+        list.push(out, 0)
+
+fn put(var out: [Int], v: Int, width: Int)
+    for k in 0..width
+        list.push(out, (v >> (8 * k)) & 255)
+
+fn patch(var out: [Int], at: Int, width: Int, v: Int)
+    for k in 0..width
+        out[at + k] = (v >> (8 * k)) & 255
+
+// Write an object and answer where a reference to it should point.
+fn write_object(var out: [Int], var vtables: [Int], v: ArrowFbObject) -> Int
+    match v
+        ArrowFbTable(fields)       => write_table(out, vtables, fields)
+        ArrowFbTables(items)       =>
+            pad_to(out, 4)
+            let at = list.len(out)
+            put(out, list.len(items), 4)
+            for _ in items
+                put(out, 0, 4)
+            for k in 0..list.len(items)
+                let target = write_object(out, vtables, items[k])
+                patch(out, at + 4 + 4 * k, 4, target - (at + 4 + 4 * k))
+            at
+        ArrowFbStructs(data, size) =>
+            pad_to(out, 8)
+            put(out, 0, 4)
+            let at = list.len(out)
+            put(out, bytes.len(data) / size, 4)
+            for byte_value in bytes.to_byte_list(data)
+                list.push(out, byte_value as Int)
+            at
+        ArrowFbInts(values, width) =>
+            pad_to(out, 8)
+            if width == 8
+                put(out, 0, 4)
+            let at = list.len(out)
+            put(out, list.len(values), 4)
+            for value in values
+                put(out, value, width)
+            at
+        ArrowFbStrings(items)      =>
+            var refs: [ArrowFbObject] = []
+            for text in items
+                list.push(refs, ArrowFbString(text))
+            write_object(out, vtables, ArrowFbTables(refs))
+        ArrowFbString(text)        =>
+            pad_to(out, 4)
+            let at = list.len(out)
+            put(out, str.len(text), 4)
+            for k in 0..str.len(text)
+                list.push(out, str.byte_at_or(text, k, 0))
+            list.push(out, 0)
+            at
+
+// A table: its vtable, then the table itself on an eight-byte boundary,
+// then the objects its offset fields name.
+fn write_table(var out: [Int], var vtables: [Int], fields: [ArrowFbField]) -> Int
+    // Where each field goes inside the table: the soffset takes the first
+    // four bytes, and each field sits at its natural alignment.
+    var offsets: [Int] = []
+    var end = 4
+    for f in fields
+        let width = match f
+            ArrowFbAbsent       => 0
+            ArrowFbScalar(_, w) => w
+            ArrowFbRef(_)       => 4
+        if width == 0
+            list.push(offsets, 0)
+        else
+            end = (end + width - 1) / width * width
+            list.push(offsets, end)
+            end = end + width
+    let size = (end + 3) / 4 * 4
+    var vtable: [Int] = []
+    put(vtable, 4 + 2 * list.len(fields), 2)
+    put(vtable, size, 2)
+    for o in offsets
+        put(vtable, o, 2)
+    var vt = shared(out, vtables, vtable)
+    if vt < 0
+        pad_to(out, 2)
+        vt = list.len(out)
+        list.append(out, vtable)
+        list.push(vtables, vt)
+    pad_to(out, 8)
+    let at = list.len(out)
+    put(out, at - vt, 4)
+    for _ in 4..size
+        list.push(out, 0)
+    for k in 0..list.len(fields)
+        if let ArrowFbScalar(value, width) = fields[k]
+            patch(out, at + offsets[k], width, value)
+    for k in 0..list.len(fields)
+        if let ArrowFbRef(target) = fields[k]
+            let where = at + offsets[k]
+            patch(out, where, 4, write_object(out, vtables, target) - where)
+    at
+
+// Where a vtable with these bytes was already written, or -1.
+fn shared(out: [Int], vtables: [Int], vtable: [Int]) -> Int
+    for vt in vtables
+        if vt + list.len(vtable) <= list.len(out) and out[vt:vt + list.len(vtable)] == vtable
+            return vt
+    -1

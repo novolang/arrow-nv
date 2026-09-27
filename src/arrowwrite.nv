@@ -1,49 +1,39 @@
 // arrowwrite.nv — the IPC stream and file formats, written into a
 // cursor the caller sized.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// Every writer takes a `Cursor` over the caller's own bytes and answers
+// how many bytes it wrote.  The sizes are answerable first:
+// `schema_message_bound`, `metadata_bound`, `body_bound`,
+// `message_bound` and `footer_bound` are exact for the messages this
+// module writes, so a caller allocates its destination once.
 //
-// THE WRITER NEVER ALLOCATES THE OUTPUT.  Every call here takes a
-// `Cursor` the caller built over its own `Bytes` and answers how many
-// bytes it wrote, so a program that writes a batch per second allocates
-// its destination once.  The arithmetic that sizes it is
-// `message_bound` and `body_bound`, published above the writers for
-// exactly that reason — a writer whose only size answer came after the
-// write would force a two-pass caller or a growable buffer, and a
-// growable buffer in a `core` package is the allocation strategy this
-// layer does not get to choose.
-//
-// A WRITE THAT DOES NOT FIT WRITES NOTHING.  `ArrowWriteBufferTooSmall`
+// A write that does not fit writes nothing.  `ArrowWriteBufferTooSmall`
 // carries what was wanted and what there was, and the cursor is
-// untouched — a partial message in a caller's buffer is worse than no
-// message, because the caller cannot tell how much of it to keep.
+// untouched.  Each message's metadata is encoded into a buffer of its
+// own first, so its length is known before the cursor is touched.
 //
-// THE BODY IS THE CALLER'S, AND SO IS ITS LAYOUT.  A batch's buffers
-// are spans into a body that already exists: this package does not
-// build a body, it writes the METADATA that describes one and then
-// copies the body through.  A caller that assembled its columns into
-// one contiguous `Bytes` with the right padding writes it with
-// `write_batch`; one that has its buffers scattered uses
-// `write_batch_parts`, which copies them into the cursor in walk order
-// and pads between them.  Two calls rather than one, because the first
-// is a memcpy and the second is a gather, and a caller should be able
-// to tell which it is paying for.
+// The body is the caller's.  `write_batch` copies a body the batch's
+// spans already point into, up to the furthest buffer, padded to eight
+// bytes.  `write_batch_parts` gathers one `Bytes` per buffer, in
+// `arrowcol.flatten_buffers` order, and pads between them.
 //
-// WHAT THIS WRITER DOES NOT DO, named rather than implied:
-//
-//   - No body compression.  Arrow's IPC compression is per-buffer LZ4
-//     frame or ZSTD, and taking those two codecs here would put them in
-//     every consumer's dependency closure to serve the minority of
-//     streams that use them.  `arrowipc.compression_of` reads the field
-//     and refuses; the row that closes it is named there.
-//   - No dictionary BUILDING.  A dictionary-encoded column arrives with
-//     its indices already computed; deciding what to intern is a
-//     decision about the data, and a format library that made it would
-//     be choosing a hash table for its callers.
-//   - No re-chunking.  A batch is written as it is.  Splitting a large
-//     batch is `arrowcol.slice` in a loop, which costs nothing, and
-//     doing it inside the writer would hide the memory the caller is
-//     about to spend.
+// Not included: body compression; building a dictionary, which is a
+// decision about the data; and splitting a batch, which is
+// `arrowcol.slice` in a loop.  An array with a non-zero offset cannot be
+// described by the IPC metadata, which has no offset field, so a sliced
+// array is refused; its buffers are rebuilt and written with
+// `write_batch_parts`.
+
+use std.bytes
+use std.float
+use std.list
+use std.str
+use arrowfault
+use arrowtype
+use arrowbuf
+use arrowfb
+use arrowcol
+use arrowipc
 
 // Which format the writer is producing.
 pub struct ArrowWriter
@@ -52,8 +42,12 @@ pub struct ArrowWriter
     // How many bytes have been written across every call, which is what
     // the file footer's block offsets count from.
     written: Int
-    // Where each message went, for the footer.  Empty in stream mode.
+    // Where each record batch went, for the footer.  Empty in stream
+    // mode.
     blocks: [ArrowBlock]
+    // Where each dictionary batch went, for the footer.  Empty in
+    // stream mode.
+    dictionary_blocks: [ArrowBlock]
     // Whether the schema message has been written yet.
     schema_written: Bool
     // The dictionary ids already sent, so a second batch does not
@@ -72,75 +66,135 @@ pub struct ArrowWriter
 //     println("${w.written}")
 // ```
 pub fn writer(mode: ArrowIpcMode, schema: ArrowSchema) -> ArrowWriter
-    todo("arrow-nv.arrowwrite.writer")
+    ArrowWriter { mode: mode, schema: schema, written: 0, blocks: [], dictionary_blocks: [], schema_written: false,
+                  dictionaries_sent: [] }
 
 // ── Sizing, before anything is written ──────────────────────────────
 
-// An upper bound on the schema message's size.
+// The size of the schema message this module writes, prefix included.
 pub fn schema_message_bound(s: ArrowSchema) -> Int
-    todo("arrow-nv.arrowwrite.schema_message_bound")
+    8 + bytes.len(encoded(message_object(1, schema_object(s), 0)))
 
-// An upper bound on one record-batch message's METADATA, given the
-// batch's shape.
+// The size of one record-batch message's metadata, prefix included.
 //
-// Metadata only: the body is the caller's and its size is
-// `body_bound`.  Two numbers because a caller streaming into a socket
-// writes the metadata into a small reusable buffer and the body
-// straight through.
+// Metadata only: the body is the caller's and its size is `body_bound`.
+// When a column's null count is not known and its bitmap is too short to
+// count, the answer is `arrowfb.metadata_bound`'s instead.
 pub fn metadata_bound(b: ArrowBatch) -> Int
-    todo("arrow-nv.arrowwrite.metadata_bound")
+    match batch_metadata(b, plain_offsets(b), [], 0)
+        Ok(meta) => 8 + bytes.len(meta)
+        Err(_)   => 8 + arrowfb.metadata_bound(list.len(arrowcol.flatten_nodes(b)),
+                                               list.len(arrowcol.flatten_buffers(b)), list.len(b.columns))
 
 // The number of bytes a batch's body occupies once every buffer is
 // padded to the required alignment.
 //
-// EXACT, not a bound: padding is arithmetic and a caller writing into a
+// Exact, not a bound: padding is arithmetic and a caller writing into a
 // preallocated file needs the number, not a ceiling.
 pub fn body_bound(b: ArrowBatch) -> Int
-    todo("arrow-nv.arrowwrite.body_bound")
+    var n = 0
+    for buf in arrowcol.flatten_buffers(b)
+        n = n + arrowbuf.padded_len(buf.len)
+    n
 
-// An upper bound on a whole message — metadata, padding and body.
+// An upper bound on a whole message: metadata, padding and body.  It
+// covers both `write_batch`, which copies the body up to its furthest
+// buffer, and `write_batch_parts`, which pads every buffer.
 pub fn message_bound(b: ArrowBatch) -> Int
-    todo("arrow-nv.arrowwrite.message_bound")
+    let reach = arrowbuf.padded_len(arrowcol.body_reach(b))
+    metadata_bound(b) + (if reach > body_bound(b) then reach else body_bound(b))
 
-// An upper bound on the file footer for a file with this many
-// dictionary and record-batch blocks.
+// The size of what `finish` writes in file mode: the end-of-stream
+// marker, the footer for this many dictionary and record-batch blocks,
+// the footer's length and the trailing magic.
 pub fn footer_bound(s: ArrowSchema, dictionaries: Int, batches: Int) -> Int
-    todo("arrow-nv.arrowwrite.footer_bound")
+    var d: [ArrowBlock] = []
+    for _ in 0..dictionaries
+        list.push(d, ArrowBlock { offset: 0, metadata_len: 0, body_len: 0 })
+    var r: [ArrowBlock] = []
+    for _ in 0..batches
+        list.push(r, ArrowBlock { offset: 0, metadata_len: 0, body_len: 0 })
+    8 + bytes.len(encoded(footer_object(s, d, r))) + 10
 
 // ── Writing ─────────────────────────────────────────────────────────
 
 // The file format's opening magic.  Nothing in stream mode.
-pub fn write_prologue(w: ArrowWriter, mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
-    todo("arrow-nv.arrowwrite.write_prologue")
+pub fn write_prologue(w: ArrowWriter, var dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    if w.mode == ArrowStreamFormat
+        return Ok((w, 0))
+    room(dst, 8)!
+    dst.put_bytes(arrowipc.file_magic())
+    Ok((advanced(w, 8), 8))
 
 // The schema message.  Exactly once, first.
-pub fn write_schema(w: ArrowWriter, mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
-    todo("arrow-nv.arrowwrite.write_schema")
+pub fn write_schema(w: ArrowWriter, var dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    if w.schema_written
+        return Err(ArrowUnexpectedMessage("schema", "record batch", arrowfault.nowhere()))
+    let meta = encoded(message_object(1, schema_object(w.schema), 0))
+    room(dst, 8 + bytes.len(meta))!
+    put_prefix(dst, bytes.len(meta))
+    dst.put_bytes(meta)
+    let n = 8 + bytes.len(meta)
+    let next = advanced(w, n)
+    Ok((ArrowWriter { mode: next.mode, schema: next.schema, written: next.written, blocks: next.blocks,
+                      dictionary_blocks: next.dictionary_blocks, schema_written: true,
+                      dictionaries_sent: next.dictionaries_sent },
+                      n))
 
 // A dictionary batch.
 //
-// `is_delta` APPENDS to the dictionary already sent under this id
+// `is_delta` appends to the dictionary already sent under this id
 // rather than replacing it, and the two are not interchangeable: a
 // reader that took a delta as a replacement resolves every index past
 // the delta's length to nothing.  A writer that sends a replacement for
 // an id it already sent is legal and a reader must handle it, which is
 // why this is an argument rather than derived from what came before.
 pub fn write_dictionary(w: ArrowWriter, entry: ArrowDictEntry, is_delta: Bool,
-                        mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
-    todo("arrow-nv.arrowwrite.write_dictionary")
+                        var dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    let nodes = flat_nodes(entry.values)
+    var parts: [Bytes] = []
+    for node in nodes
+        for buf in node.buffers
+            if not arrowbuf.fits(entry.body, buf)
+                return Err(ArrowShortBody(arrowbuf.end_of(buf), bytes.len(entry.body), arrowfault.at_byte(-1, buf.start)))
+            list.push(parts, bytes.slice(entry.body, buf.start, arrowbuf.end_of(buf)))
+    let layout = packed(parts)
+    let batch = record_batch_object(entry.values.length, nodes, entry.body, layout)!
+    let dict = ArrowFbTable([ArrowFbScalar(entry.id, 8), ArrowFbRef(batch), ArrowFbScalar((if is_delta then 1 else 0), 1)])
+    let meta = encoded(message_object(2, dict, body_len(layout)))
+    let n = put_message(dst, meta, parts, layout)!
+    let block = ArrowBlock { offset: w.written, metadata_len: 8 + bytes.len(meta), body_len: body_len(layout) }
+    var sent = w.dictionaries_sent[:]
+    list.push(sent, entry.id)
+    var dict_blocks = w.dictionary_blocks[:]
+    if w.mode == ArrowFileFormat
+        list.push(dict_blocks, block)
+    Ok((ArrowWriter { mode: w.mode, schema: w.schema, written: w.written + n, blocks: w.blocks,
+                      dictionary_blocks: dict_blocks, schema_written: w.schema_written, dictionaries_sent: sent },
+                      n))
 
 // A record batch whose body the caller already has contiguous and
 // padded.
 //
-// The fast path: the metadata is built from the batch's spans and the
-// body is copied through unchanged.  `arrowcol.validate_batch` is what
-// says whether the body really is what the spans claim, and this call
-// does not re-run it — a writer that validated every batch would make
-// the check unavoidable for a caller that built the batch itself and
-// knows.
+// The metadata is built from the batch's spans, and the body is copied
+// through up to the end of its furthest buffer, padded to eight bytes.
+// A null count that is not known is counted from `body`.  This does not
+// run `arrowcol.validate_batch`; a caller that did not build the batch
+// runs it first.  A sliced array is `ArrowTypeUnsupported`, since the
+// metadata has no offset field, and a body shorter than the spans reach
+// is `ArrowShortBody`.
 pub fn write_batch(w: ArrowWriter, b: ArrowBatch, body: Bytes,
-                   mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
-    todo("arrow-nv.arrowwrite.write_batch")
+                   var dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    for node in arrowcol.flatten_nodes(b)
+        if node.offset != 0
+            return Err(ArrowTypeUnsupported("an array with a non-zero offset", arrowfault.nowhere()))
+    let reach = arrowcol.body_reach(b)
+    if reach > bytes.len(body)
+        return Err(ArrowShortBody(reach, bytes.len(body), arrowfault.nowhere()))
+    let whole = arrowbuf.padded_len(reach)
+    let meta = batch_metadata(b, plain_offsets(b), [body], whole)!
+    let n = put_message(dst, meta, [bytes.slice(body, 0, reach)], [(0, whole)])!
+    Ok((recorded(w, 8 + bytes.len(meta), whole, n), n))
 
 // A record batch whose buffers are scattered across several of the
 // caller's own byte strings.
@@ -152,16 +206,33 @@ pub fn write_batch(w: ArrowWriter, b: ArrowBatch, body: Bytes,
 // concatenate them first — which is the allocation this package exists
 // not to make.
 pub fn write_batch_parts(w: ArrowWriter, b: ArrowBatch, parts: [Bytes],
-                         mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
-    todo("arrow-nv.arrowwrite.write_batch_parts")
+                         var dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    let buffers = arrowcol.flatten_buffers(b)
+    if list.len(parts) != list.len(buffers)
+        return Err(ArrowBufferCountWrong(list.len(buffers), list.len(parts), arrowfault.nowhere()))
+    let layout = packed(parts)
+    let meta = batch_metadata(b, layout, parts, body_len(layout))!
+    let n = put_message(dst, meta, parts, layout)!
+    Ok((recorded(w, 8 + bytes.len(meta), body_len(layout), n), n))
 
 // The end of a stream: the zero-length message.
 //
 // In file mode this also writes the footer, its length and the trailing
-// magic — which is why it is one call: a file whose footer is missing
-// is a file no reader opens, and a caller that could forget it would.
-pub fn finish(w: ArrowWriter, mut dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
-    todo("arrow-nv.arrowwrite.finish")
+// `ARROW1`, in one call, so that a file cannot be left without its
+// footer.
+pub fn finish(w: ArrowWriter, var dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
+    if w.mode == ArrowStreamFormat
+        room(dst, 8)!
+        put_prefix(dst, 0)
+        return Ok((advanced(w, 8), 8))
+    let footer = encoded(footer_object(w.schema, w.dictionary_blocks, w.blocks))
+    let n = 8 + bytes.len(footer) + 10
+    room(dst, n)!
+    put_prefix(dst, 0)
+    dst.put_bytes(footer)
+    dst.put_u32(bytes.len(footer))
+    dst.put_bytes(bytes.slice(arrowipc.file_magic(), 0, 6))
+    Ok((advanced(w, n), n))
 
 // ── Building the pieces a batch is made of ──────────────────────────
 
@@ -169,10 +240,10 @@ pub fn finish(w: ArrowWriter, mut dst: Cursor) -> Result<(ArrowWriter, Int), Arr
 //
 // LSB first within each byte, padded to the alignment, and the trailing
 // bits of the last byte set to zero — which is not required by the
-// specification and IS required by every implementation that counts
+// specification and is required by every implementation that counts
 // nulls with a population count over whole words.
-pub fn write_validity(present: [Bool], mut dst: Cursor) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowwrite.write_validity")
+pub fn write_validity(present: [Bool], var dst: Cursor) -> Result<Int, ArrowFault>
+    write_bitmap(present, dst)
 
 // A 32-bit offsets buffer for these element lengths.
 //
@@ -180,36 +251,58 @@ pub fn write_validity(present: [Bool], mut dst: Cursor) -> Result<Int, ArrowFaul
 // `ArrowOffsetPastEnd` when the total exceeds what a 32-bit offset can
 // hold, which is the moment a caller has to move to `LargeUtf8` and the
 // moment an implementation that wrapped would corrupt silently.
-pub fn write_offsets32(lengths: [Int], mut dst: Cursor) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowwrite.write_offsets32")
+pub fn write_offsets32(lengths: [Int], var dst: Cursor) -> Result<Int, ArrowFault>
+    write_offsets(lengths, 4, dst)
 
 // A 64-bit offsets buffer.
-pub fn write_offsets64(lengths: [Int], mut dst: Cursor) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowwrite.write_offsets64")
+pub fn write_offsets64(lengths: [Int], var dst: Cursor) -> Result<Int, ArrowFault>
+    write_offsets(lengths, 8, dst)
 
 // A fixed-width values buffer from integers, at `bits` per element.
-pub fn write_ints(values: [Int], bits: Int, mut dst: Cursor) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowwrite.write_ints")
+pub fn write_ints(values: [Int], bits: Int, var dst: Cursor) -> Result<Int, ArrowFault>
+    let width = bits / 8
+    let n = arrowbuf.padded_len(list.len(values) * width)
+    room(dst, n)!
+    for v in values
+        put_le(dst, v, width)
+    pad(dst, n - list.len(values) * width)
+    Ok(n)
 
 // A fixed-width values buffer from floats, at `bits` per element.
 //
-// `bits` of 16 or 32 ROUNDS, and the rounding is to nearest with ties
+// `bits` of 16 or 32 rounds, and the rounding is to nearest with ties
 // to even — the IEEE default, named here because a value that does not
 // round-trip is the reason a caller chose 64 in the first place.
-pub fn write_floats(values: [Float], bits: Int, mut dst: Cursor) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowwrite.write_floats")
+pub fn write_floats(values: [Float], bits: Int, var dst: Cursor) -> Result<Int, ArrowFault>
+    let width = bits / 8
+    let n = arrowbuf.padded_len(list.len(values) * width)
+    room(dst, n)!
+    for v in values
+        let raw = if bits == 16
+            narrow(v, 5, 10)
+        else
+            if bits == 32
+                narrow(v, 8, 23)
+            else
+                float.to_bits(v)
+        put_le(dst, raw, width)
+    pad(dst, n - list.len(values) * width)
+    Ok(n)
 
-// A `Bool` values buffer — one BIT per element.
-pub fn write_bits(values: [Bool], mut dst: Cursor) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowwrite.write_bits")
+// A `Bool` values buffer — one bit per element.
+pub fn write_bits(values: [Bool], var dst: Cursor) -> Result<Int, ArrowFault>
+    write_bitmap(values, dst)
 
 // Zero bytes up to the next alignment boundary.
 //
 // Published because a caller assembling a body by hand has to pad
 // between buffers, and because the padding is what a reader's offsets
 // assume.
-pub fn write_padding(written: Int, mut dst: Cursor) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowwrite.write_padding")
+pub fn write_padding(written: Int, var dst: Cursor) -> Result<Int, ArrowFault>
+    let n = arrowbuf.padded_len(written) - written
+    room(dst, n)!
+    pad(dst, n)
+    Ok(n)
 
 // ── Writing a whole stream to a host ────────────────────────────────
 
@@ -221,9 +314,359 @@ pub fn write_padding(written: Int, mut dst: Cursor) -> Result<Int, ArrowFault>
 // `[io, fs]`, an in-memory sink charges nothing, and this package
 // remains `core`.
 //
-// The convenience over the cursor writers, not a replacement: a caller
-// that cannot give up control still needs them, and one writing a file
-// in a loop should not have to write the pump.
+// The convenience over the cursor writers: it writes the prologue, the
+// schema, each batch's dictionaries not yet sent (a later entry under an
+// id already sent goes as a delta), each batch with `write_batch`, and
+// the end, then hands the bytes to `sink` until it has taken them all.
+// A sink that fails or takes nothing is `ArrowWriteBufferTooSmall`.
+
 pub fn write_all<S: Write[e]>(mode: ArrowIpcMode, s: ArrowSchema, batches: [ArrowBatch],
                               bodies: [Bytes], sink: S) -> Result<Int, ArrowFault> [e]
-    todo("arrow-nv.arrowwrite.write_all")
+    var size = schema_message_bound(s) + 8 + footer_bound(s, 0, list.len(batches)) + 8
+    for b in batches
+        size = size + message_bound(b)
+        for d in b.dictionaries
+            size = size + metadata_bound(arrowcol.batch(s, [d.values], d.values.length))
+                + arrowcol.body_reach(arrowcol.batch(s, [d.values], d.values.length)) + 8 * 16
+    if list.len(bodies) != list.len(batches)
+        return Err(ArrowBufferCountWrong(list.len(batches), list.len(bodies), arrowfault.nowhere()))
+    var c = bytes.cursor_le(bytes.zeros(size))
+    var w = writer(mode, s)
+    w = write_prologue(w, c)!.0
+    w = write_schema(w, c)!.0
+    for k in 0..list.len(batches)
+        var seen: [Int] = []
+        for d in batches[k].dictionaries
+            let sent_before = count_of(w.dictionaries_sent, d.id)
+            let here = count_of(seen, d.id)
+            list.push(seen, d.id)
+            if here >= sent_before
+                w = write_dictionary(w, d, here > 0, c)!.0
+        w = write_batch(w, batches[k], bodies[k], c)!.0
+    w = finish(w, c)!.0
+    let out = bytes.slice(c.finish(), 0, w.written)
+    var done = 0
+    loop
+        if done >= bytes.len(out)
+            break
+        match sink.write(bytes.slice(out, done, bytes.len(out)))
+            Ok(n)  =>
+                if n <= 0
+                    return Err(ArrowWriteBufferTooSmall(bytes.len(out) - done, 0, arrowfault.at_byte(-1, done)))
+                done = done + n
+            Err(_) =>
+                return Err(ArrowWriteBufferTooSmall(bytes.len(out) - done, 0, arrowfault.at_byte(-1, done)))
+    Ok(done)
+
+// ── the parts the writers share ─────────────────────────────────────
+
+fn room(dst: Cursor, n: Int) -> Result<Unit, ArrowFault>
+    let left = dst.remaining()
+    if n > left
+        return Err(ArrowWriteBufferTooSmall(n, left, arrowfault.nowhere()))
+    Ok()
+
+fn pad(var dst: Cursor, n: Int)
+    for _ in 0..n
+        dst.put_u8(0)
+
+fn put_le(var dst: Cursor, v: Int, width: Int)
+    for k in 0..width
+        dst.put_u8((v >> (8 * k)) & 255)
+
+// The continuation marker and a metadata length.
+fn put_prefix(var dst: Cursor, len: Int)
+    dst.put_u32(4294967295)
+    dst.put_u32(len)
+
+fn advanced(w: ArrowWriter, n: Int) -> ArrowWriter
+    ArrowWriter { mode: w.mode, schema: w.schema, written: w.written + n, blocks: w.blocks,
+                  dictionary_blocks: w.dictionary_blocks, schema_written: w.schema_written,
+                  dictionaries_sent: w.dictionaries_sent }
+
+// The writer after a record batch of this metadata and body length.
+fn recorded(w: ArrowWriter, meta_len: Int, body: Int, n: Int) -> ArrowWriter
+    var blocks = w.blocks[:]
+    if w.mode == ArrowFileFormat
+        list.push(blocks, ArrowBlock { offset: w.written, metadata_len: meta_len, body_len: body })
+    ArrowWriter { mode: w.mode, schema: w.schema, written: w.written + n, blocks: blocks,
+                  dictionary_blocks: w.dictionary_blocks, schema_written: w.schema_written,
+                  dictionaries_sent: w.dictionaries_sent }
+
+fn count_of(xs: [Int], v: Int) -> Int
+    var n = 0
+    for x in xs
+        if x == v
+            n = n + 1
+    n
+
+fn encoded(root: ArrowFbObject) -> Bytes
+    let done = arrowfb.encode(arrowfb.builder(2147483647), root)
+    match done
+        Ok(pair) =>
+            let (_, meta) = pair
+            meta
+        // cov: skip — a builder of 2 GiB holds any metadata these writers make
+        Err(_)   => bytes.zeros(0)
+
+// Where each buffer goes in a body laid out from these parts, each
+// padded to eight bytes.
+fn packed(parts: [Bytes]) -> [(Int, Int)]
+    var out: [(Int, Int)] = []
+    var at = 0
+    for p in parts
+        list.push(out, (at, bytes.len(p)))
+        at = at + arrowbuf.padded_len(bytes.len(p))
+    out
+
+fn body_len(layout: [(Int, Int)]) -> Int
+    var n = 0
+    for pair in layout
+        let (_, len) = pair
+        n = n + arrowbuf.padded_len(len)
+    n
+
+// The buffers of a batch where they already are in its body.
+fn plain_offsets(b: ArrowBatch) -> [(Int, Int)]
+    var out: [(Int, Int)] = []
+    for buf in arrowcol.flatten_buffers(b)
+        list.push(out, (buf.start, buf.len))
+    out
+
+// A whole message: prefix, metadata, and the parts laid out as `layout`
+// says, with zeros between and after them.
+fn put_message(var dst: Cursor, meta: Bytes, parts: [Bytes],
+               layout: [(Int, Int)]) -> Result<Int, ArrowFault>
+    let body = body_len(layout)
+    let n = 8 + bytes.len(meta) + body
+    room(dst, n)!
+    put_prefix(dst, bytes.len(meta))
+    dst.put_bytes(meta)
+    var at = 0
+    for k in 0..list.len(parts)
+        let (start, _) = layout[k]
+        pad(dst, start - at)
+        dst.put_bytes(parts[k])
+        at = start + bytes.len(parts[k])
+    pad(dst, body - at)
+    Ok(n)
+
+// The metadata of a record batch message whose buffers sit at `layout`
+// in a body of `whole` bytes.  `bodies` is where a null count that is
+// not known is counted from.
+fn batch_metadata(b: ArrowBatch, layout: [(Int, Int)], bodies: [Bytes],
+                  whole: Int) -> Result<Bytes, ArrowFault>
+    let source = if list.len(bodies) == 1
+        bodies[0]
+    else
+        bytes.zeros(0)
+    let batch = record_batch_object(b.rows, arrowcol.flatten_nodes(b), source, layout)!
+    Ok(encoded(message_object(3, batch, whole)))
+
+fn record_batch_object(rows: Int, nodes: [ArrowArray], body: Bytes,
+                       layout: [(Int, Int)]) -> Result<ArrowFbObject, ArrowFault>
+    var node_words: [Int] = []
+    for node in nodes
+        var nulls = node.null_count
+        if nulls < 0
+            nulls = arrowcol.recount_nulls(body, node)!
+        list.push(node_words, node.length)
+        list.push(node_words, nulls)
+    var buffer_words: [Int] = []
+    for pair in layout
+        let (start, len) = pair
+        list.push(buffer_words, start)
+        list.push(buffer_words, len)
+    Ok(ArrowFbTable([ArrowFbScalar(rows, 8), ArrowFbRef(ArrowFbStructs(words(node_words), 16)),
+                     ArrowFbRef(ArrowFbStructs(words(buffer_words), 16))]))
+
+// Little-endian 64-bit words, for a vector of structs.
+fn words(values: [Int]) -> Bytes
+    var out: [Int] = []
+    for v in values
+        for k in 0..8
+            list.push(out, (v >> (8 * k)) & 255)
+    bytes.from_byte_list(out)
+
+fn flat_nodes(a: ArrowArray) -> [ArrowArray]
+    var out: [ArrowArray] = [a]
+    for c in a.children
+        list.append(out, flat_nodes(c))
+    out
+
+// A `Message` table: metadata version V5, the header and the body
+// length.
+fn message_object(code: Int, header: ArrowFbObject, body: Int) -> ArrowFbObject
+    ArrowFbTable([ArrowFbScalar(4, 2), ArrowFbScalar(code, 1), ArrowFbRef(header), ArrowFbScalar(body, 8)])
+
+fn footer_object(s: ArrowSchema, dictionaries: [ArrowBlock], batches: [ArrowBlock]) -> ArrowFbObject
+    ArrowFbTable([ArrowFbScalar(4, 2), ArrowFbRef(schema_object(s)), ArrowFbRef(ArrowFbStructs(block_words(dictionaries), 24)),
+                  ArrowFbRef(ArrowFbStructs(block_words(batches), 24))])
+
+// `Block` structs: an int64 offset, an int32 metadata length and four
+// bytes of padding, and an int64 body length.
+fn block_words(blocks: [ArrowBlock]) -> Bytes
+    var out: [Int] = []
+    for b in blocks
+        list.push(out, b.offset)
+        list.push(out, b.metadata_len)
+        list.push(out, b.body_len)
+    words(out)
+
+fn schema_object(s: ArrowSchema) -> ArrowFbObject
+    var fields: [ArrowFbObject] = []
+    for f in s.fields
+        list.push(fields, field_object(f))
+    ArrowFbTable([ArrowFbScalar((if s.endianness == ArrowBig then 1 else 0), 2), ArrowFbRef(ArrowFbTables(fields)),
+                  key_values(s.metadata)])
+
+fn key_values(kvs: [ArrowKeyValue]) -> ArrowFbField
+    if list.len(kvs) == 0
+        return ArrowFbAbsent
+    var items: [ArrowFbObject] = []
+    for kv in kvs
+        list.push(items,
+            ArrowFbTable([ArrowFbRef(ArrowFbString(kv.key)), ArrowFbRef(ArrowFbString(kv.value))]))
+    ArrowFbRef(ArrowFbTables(items))
+
+fn field_object(f: ArrowField) -> ArrowFbObject
+    var children: [ArrowFbObject] = []
+    for c in f.children
+        list.push(children, field_object(c))
+    let (code, type_table) = type_object(f)
+    let dict = match f.dictionary
+        Some(d) => ArrowFbRef(ArrowFbTable([ArrowFbScalar(d.id, 8), ArrowFbRef(int_object(d.index_type)),
+                                            ArrowFbScalar((if d.ordered then 1 else 0), 1)]))
+        None    => ArrowFbAbsent
+    ArrowFbTable([ArrowFbRef(ArrowFbString(f.name)), ArrowFbScalar((if f.nullable then 1 else 0), 1), ArrowFbScalar(code, 1),
+                  ArrowFbRef(type_table), dict, ArrowFbRef(ArrowFbTables(children)), key_values(f.metadata)])
+
+fn unit_code(u: ArrowTimeUnit) -> Int
+    match u
+        ArrowSecond => 0
+        ArrowMilli  => 1
+        ArrowMicro  => 2
+        ArrowNano   => 3
+
+fn int_object(t: ArrowType) -> ArrowFbObject
+    let signed = t == ArrowInt8 or t == ArrowInt16 or t == ArrowInt32 or t == ArrowInt64
+    ArrowFbTable([ArrowFbScalar(arrowtype.fixed_width_bits(t), 4), ArrowFbScalar((if signed then 1 else 0), 1)])
+
+// The `Type` union member for a field's type (Schema.fbs), as its code
+// and its table.
+fn type_object(f: ArrowField) -> (Int, ArrowFbObject)
+    let empty = ArrowFbTable([])
+    match f.data_type
+        ArrowNull               => (1, empty)
+        ArrowFloat16            => (3, ArrowFbTable([ArrowFbScalar(0, 2)]))
+        ArrowFloat32            => (3, ArrowFbTable([ArrowFbScalar(1, 2)]))
+        ArrowFloat64            => (3, ArrowFbTable([ArrowFbScalar(2, 2)]))
+        ArrowBinary             => (4, empty)
+        ArrowUtf8               => (5, empty)
+        ArrowBool               => (6, empty)
+        ArrowDecimal128(p, sc)  => (7, ArrowFbTable([ArrowFbScalar(p, 4), ArrowFbScalar(sc, 4), ArrowFbScalar(128, 4)]))
+        ArrowDecimal256(p, sc)  => (7, ArrowFbTable([ArrowFbScalar(p, 4), ArrowFbScalar(sc, 4), ArrowFbScalar(256, 4)]))
+        ArrowDate32             => (8, ArrowFbTable([ArrowFbScalar(0, 2)]))
+        ArrowDate64             => (8, ArrowFbTable([ArrowFbScalar(1, 2)]))
+        ArrowTime32(u)          => (9, ArrowFbTable([ArrowFbScalar(unit_code(u), 2), ArrowFbScalar(32, 4)]))
+        ArrowTime64(u)          => (9, ArrowFbTable([ArrowFbScalar(unit_code(u), 2), ArrowFbScalar(64, 4)]))
+        ArrowTimestamp(u, zone) =>
+            let tz = if zone == ""
+                ArrowFbAbsent
+            else
+                ArrowFbRef(ArrowFbString(zone))
+            (10, ArrowFbTable([ArrowFbScalar(unit_code(u), 2), tz]))
+        ArrowInterval(u)        =>
+            let code = if u == ArrowYearMonth
+                0
+            else
+                if u == ArrowDayTime
+                    1
+                else
+                    2
+            (11, ArrowFbTable([ArrowFbScalar(code, 2)]))
+        ArrowList               => (12, empty)
+        ArrowStruct             => (13, empty)
+        ArrowUnion(mode)        =>
+            let dense = if mode == ArrowDenseUnion
+                1
+            else
+                0
+            (14, ArrowFbTable([ArrowFbScalar(dense, 2), ArrowFbRef(ArrowFbInts(f.type_ids, 4))]))
+        ArrowFixedSizeBinary(w) => (15, ArrowFbTable([ArrowFbScalar(w, 4)]))
+        ArrowFixedSizeList(w)   => (16, ArrowFbTable([ArrowFbScalar(w, 4)]))
+        ArrowMap(sorted)        => (17, ArrowFbTable([ArrowFbScalar((if sorted then 1 else 0), 1)]))
+        ArrowDuration(u)        => (18, ArrowFbTable([ArrowFbScalar(unit_code(u), 2)]))
+        ArrowLargeBinary        => (19, empty)
+        ArrowLargeUtf8          => (20, empty)
+        ArrowLargeList          => (21, empty)
+        other                   => (2, int_object(other))
+
+// ── the buffer builders ─────────────────────────────────────────────
+
+fn write_bitmap(flags: [Bool], var dst: Cursor) -> Result<Int, ArrowFault>
+    let n = arrowbuf.bitmap_bytes(list.len(flags))
+    room(dst, n)!
+    var used = 0
+    var acc = 0
+    for i in 0..list.len(flags)
+        if flags[i]
+            acc = acc | (1 << (i % 8))
+        if i % 8 == 7 or i == list.len(flags) - 1
+            dst.put_u8(acc)
+            used = used + 1
+            acc = 0
+    pad(dst, n - used)
+    Ok(n)
+
+fn write_offsets(lengths: [Int], width: Int, var dst: Cursor) -> Result<Int, ArrowFault>
+    let n = arrowbuf.padded_len((list.len(lengths) + 1) * width)
+    let limit = if width == 4
+        2147483647
+    else
+        9223372036854775807
+    var total = 0
+    for i in 0..list.len(lengths)
+        if lengths[i] < 0
+            return Err(ArrowNegativeLength(lengths[i], arrowfault.nowhere()))
+        if total > limit - lengths[i]
+            return Err(ArrowOffsetPastEnd(i + 1, total, limit, arrowfault.nowhere()))
+        total = total + lengths[i]
+    room(dst, n)!
+    var at = 0
+    put_le(dst, 0, width)
+    for len in lengths
+        at = at + len
+        put_le(dst, at, width)
+    pad(dst, n - (list.len(lengths) + 1) * width)
+    Ok(n)
+
+// `v` rounded to the nearest binary16 or binary32 value, ties to even,
+// as that value's bits.  `e` and `m` are the exponent and fraction
+// widths.
+fn narrow(v: Float, e: Int, m: Int) -> Int
+    let raw = float.to_bits(v)
+    let sign = ((raw >> 63) & 1) << (e + m)
+    let exp = (raw >> 52) & 2047
+    let frac = raw & 4503599627370495
+    let top = (1 << e) - 1
+    if exp == 2047
+        return sign | (top << m) | (if frac != 0 then 1 << (m - 1) else 0)
+    let biased = exp - 1023 + (1 << (e - 1)) - 1
+    if exp == 0 or biased < 0 - m
+        return sign
+    if biased <= 0
+        return sign | rounded(frac | 4503599627370496, 52 - m + 1 - biased)
+    let r = rounded((biased << 52) | frac, 52 - m)
+    if r >= (top << m)
+        return sign | (top << m)
+    sign | r
+
+// `x` shifted right by `s` bits, rounded to nearest with ties to even.
+fn rounded(x: Int, s: Int) -> Int
+    let q = x >> s
+    let rest = x & ((1 << s) - 1)
+    let half = 1 << (s - 1)
+    if rest > half or rest == half and (q & 1) == 1
+        return q + 1
+    q

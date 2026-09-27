@@ -1,15 +1,12 @@
 [package]
 name        = "arrow-nv"
-version     = "0.0.2"
-description = "The Apache Arrow columnar format as values: the schema with every logical type, the buffer layout per type, a record batch whose buffers are SPANS into one body the caller owns, and the IPC stream and file formats as a feed-and-drain reader and a writer into a caller's cursor.  Nothing is copied on the way in and nothing is performed.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "The Apache Arrow columnar format as values: the schema with every logical type, the buffer layout per type, a record batch whose buffers are spans into one body the caller owns, and the IPC stream and file formats as a feed-and-drain reader and a writer into a caller's cursor.  Nothing is copied on the way in and nothing is performed."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# `experimental` because no program outside this repository has used the
+# package yet.
+stability   = "experimental"
 
 # `core`.  A record batch is bytes the caller already holds plus the
 # arithmetic that says where each column is inside them, and that
@@ -17,11 +14,8 @@ stability   = "draft"
 # no clock is read.  The IPC reader is a feed-and-drain state machine
 # and the writer fills a `Cursor` the caller sized.
 #
-# No `@tier(embedded)` claim, and none is intended.  A schema is a tree
-# of boxed structs with strings in it, a batch is a growable list of
-# arrays, and a device that reads one column of one Arrow file is not a
-# consumer anybody has asked for.  The audit's `core-embedded` row
-# passes as "makes no device claim".
+# There is no microcontroller build: a schema is a tree of boxed structs
+# with strings in it, and a batch is a growable list of arrays.
 layer       = "core"
 
 category    = "encoding"
@@ -29,7 +23,7 @@ category    = "encoding"
 tags        = ["arrow", "columnar", "record-batch", "ipc", "flatbuffers", "zero-copy", "dataframe", "sans-io"]
 repository  = "https://github.com/novolang/arrow-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.13.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -38,29 +32,13 @@ novo        = ">= 0.8.9"
 "README.md" = "A column is a span into bytes you already hold"
 
 [dependencies]
-# calendar-nv, FOR THE TEMPORAL LOGICAL TYPES AND FOR NOTHING ELSE.
-#
-# Arrow stores a date as a day count and a timestamp as a count of
-# seconds, millis, micros or nanos since the epoch — integers, which is
-# what `arrowtime` reads out of a buffer.  The value a notebook wants
-# from one is a civil date or a civil datetime, and `CivilDate` /
-# `CivilDateTime` are exactly that, in a `core` package that already
-# owns the proleptic Gregorian arithmetic.  Re-deriving days-from-civil
-# here would be a second implementation of the one calculation in the
-# whole file format that is easy to get wrong at the March boundary.
-#
-# What this does NOT take: a clock, an instant or a timezone database.
-# A `Timestamp` field's zone is a STRING in the schema, this package
-# carries it unread, and resolving it is a host's job — which is said
-# in `arrowtime`'s header rather than approximated here.
-calendar-nv = "^0.0.2"
+# calendar-nv, for the temporal logical types.  Arrow stores a date as a
+# day count and a timestamp as a count since the epoch, and `arrowtime`
+# turns those integers into calendar-nv's civil dates and times.  No
+# clock, instant or timezone database is taken: a timestamp's zone is a
+# string this package carries unread.
+calendar-nv = "^0.2.0"
 
-# DELIBERATELY ABSENT: dataframe-nv.
-#
-# The plan's note for this row is "the interchange format behind
-# dataframe-nv", and an interchange format that depends on one of its
-# consumers cannot be behind it: the edge dataframe-nv will want, from
-# its columns to these buffers, would be a cycle.  So the conversion is
-# declared as an INTERFACE instead — `arrowdf`'s two traits, which
-# dataframe-nv (or a third package) implements — and this package names
-# the four cell kinds without importing them.
+# dataframe-nv is not a dependency.  It is a consumer of this format, so
+# the conversion is declared as `arrowdf`'s two traits, which a data
+# frame implements, and the edge back would close a cycle.

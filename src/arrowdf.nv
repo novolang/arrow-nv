@@ -1,48 +1,44 @@
-// arrowdf.nv — the conversion to and from a data frame's columns,
-// declared as an interface rather than taken as a dependency.
+// arrowdf.nv — the conversion between an Arrow batch and a data frame's
+// columns, declared as two traits rather than taken as a dependency.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// dataframe-nv is a consumer of this format, so this package cannot
+// depend on it: the edge back would close a cycle.  The conversion
+// crosses as two traits this package declares and the other side
+// implements.  `ArrowColumnSink` receives an Arrow batch a column at a
+// time; `ArrowColumnSource` hands columns over to be written.  A
+// database result set or a CSV reader's typed records can implement
+// them as well as a data frame can.
 //
-// WHY THIS IS TWO TRAITS AND NOT A DEPENDENCY ON dataframe-nv.  The
-// plan's note for this package is "the interchange format behind
-// dataframe-nv".  A format that is BEHIND a consumer cannot depend on
-// it: the edge dataframe-nv eventually wants — from its columns to
-// these buffers — would close a cycle, and the two packages could never
-// both be published.  So the conversion crosses the boundary as a pair
-// of traits this package declares and the other side implements, and
-// arrow-nv's dependency list stays at one entry.
+// Arrow has thirty-odd logical types and a data frame has four.
+// `cell_kind_of` answers the narrowing for a type before any data is
+// read, and `ArrowCellUnsupported` is a value, not a fault, so a caller
+// checks its schema once.  `unsupported_columns` names the columns no
+// cell holds, and the caller decides whether to drop them, refuse the
+// file or read them another way.
 //
-// The same shape serves a second caller nobody has written yet.  A
-// database's result set, a CSV reader's typed records and a data
-// frame's columns are all "a named, typed, nullable sequence", and any
-// of them can implement `ArrowColumnSink` to receive an Arrow batch or
-// `ArrowColumnSource` to produce one.  Naming the interface rather than
-// the package is what makes that true.
+// Three narrowings lose information, and `narrowing_of` reports each
+// rather than performing it silently:
 //
-// **THE NARROWING IS THE HONEST PART.**  Arrow has thirty-odd logical
-// types and a data frame has four.  A conversion that pretended
-// otherwise would answer a `Result` that fails on the eleventh column
-// of somebody's file with no warning beforehand — so `cell_kind_of`
-// answers the narrowing for a TYPE, before any data is read, and
-// `ArrowCellUnsupported` is a value rather than an error.  A caller
-// checks its schema once and knows which columns it can take; the ones
-// it cannot are named in `unsupported_columns`, and the decision to
-// drop them, refuse the file or read them as text is the caller's.
+// - A `UInt64` past 2^63 has no `Int`; the bit pattern is kept and the
+//   sign is wrong.
+// - A decimal has no exact `Float`; scaling loses digits.
+// - A dictionary column is resolved to its values, so a column of small
+//   indices becomes a column of strings.  `lossy_columns` reports it,
+//   because it is a property of the field.
 //
-// WHAT IS LOST, AND WHERE IT IS SAID.  Four narrowings destroy
-// information and all four are reported by `narrowing_of` rather than
-// performed silently:
-//
-//   `UInt64` past 2^63     no `Int` holds it; the bit pattern is kept
-//                          and the sign is wrong.
-//   `Decimal128/256`       no exact `Float`; scaling loses digits.
-//   `Timestamp(Nano)`      past 2262, no `Int` nanosecond holds it.
-//   a dictionary column    resolved to its VALUES, so a column that
-//                          was four bytes a row becomes a string a row.
-//
-// A caller that wants none of that reads the arrays directly with
-// `arrowcol`; this module is the convenience for the caller that wants
-// a data frame and should be told what it costs.
+// A null reaches a sink as a `false` in the present mask and the
+// kind's zero in the values.
+
+use std.bytes
+use std.float
+use std.int
+use std.list
+use std.str
+use arrowfault
+use arrowtype
+use arrowbuf
+use arrowcol
+use arrowwrite
 
 // The four cell kinds a data frame has, plus the answer for a column
 // that has none.
@@ -56,9 +52,9 @@ pub enum ArrowCellKind
     ArrowCellInt
     ArrowCellBool
     ArrowCellStr
-    // No data frame cell holds this column — a nested type, a union, a
-    // decimal, an interval, a fixed-size binary.  A VALUE and not a
-    // fault: see this module's header.
+    // No data frame cell holds this column: a nested type, a union, an
+    // interval, a binary or fixed-size binary.  A value and not a fault:
+    // see this module's header.
     ArrowCellUnsupported
 
 // What a narrowing costs, when it costs something.
@@ -70,7 +66,9 @@ pub enum ArrowNarrowing
     ArrowNarrowSignLost
     // Digits are lost — a decimal scaled into a float.
     ArrowNarrowPrecisionLost
-    // Values outside a range are lost — nanoseconds past 2262.
+    // Values outside a range are lost.  No type narrows this way to one
+    // of the four kinds today; the variant is kept for a conversion that
+    // does.
     ArrowNarrowRangeLost
     // The column grows: a dictionary's indices become its values.
     ArrowNarrowExpanded
@@ -79,7 +77,7 @@ pub enum ArrowNarrowing
 
 // Which data frame cell kind a column of this Arrow type narrows to.
 //
-// A pure function of the TYPE, so a caller checks a schema before it
+// A pure function of the type, so a caller checks a schema before it
 // reads a byte.
 //
 // ```novo
@@ -91,33 +89,73 @@ pub enum ArrowNarrowing
 //         _            => println("something else")
 // ```
 pub fn cell_kind_of(t: ArrowType) -> ArrowCellKind
-    todo("arrow-nv.arrowdf.cell_kind_of")
+    match t
+        ArrowFloat16          => ArrowCellFloat
+        ArrowFloat32          => ArrowCellFloat
+        ArrowFloat64          => ArrowCellFloat
+        ArrowDecimal128(_, _) => ArrowCellFloat
+        ArrowDecimal256(_, _) => ArrowCellFloat
+        ArrowBool             => ArrowCellBool
+        ArrowUtf8             => ArrowCellStr
+        ArrowLargeUtf8        => ArrowCellStr
+        ArrowInterval(_)      => ArrowCellUnsupported
+        ArrowNull             => ArrowCellUnsupported
+        _                     =>
+            if arrowtype.fixed_width_bits(t) > 0 and arrowtype.fixed_width_bits(t) <= 64 and not fixed_binary(t)
+                ArrowCellInt
+            else
+                ArrowCellUnsupported
 
 // What converting a column of this type costs.
 pub fn narrowing_of(t: ArrowType) -> ArrowNarrowing
-    todo("arrow-nv.arrowdf.narrowing_of")
+    match t
+        ArrowUInt64           => ArrowNarrowSignLost
+        ArrowDecimal128(_, _) => ArrowNarrowPrecisionLost
+        ArrowDecimal256(_, _) => ArrowNarrowPrecisionLost
+        _                     => if cell_kind_of(t) == ArrowCellUnsupported
+            ArrowNarrowRefused
+        else
+            ArrowNarrowExact
 
 // The narrowing's name, for a warning a caller shows once per file.
 pub fn narrowing_name(n: ArrowNarrowing) -> Str
-    todo("arrow-nv.arrowdf.narrowing_name")
+    match n
+        ArrowNarrowExact         => "exact"
+        ArrowNarrowSignLost      => "sign lost"
+        ArrowNarrowPrecisionLost => "precision lost"
+        ArrowNarrowRangeLost     => "range lost"
+        ArrowNarrowExpanded      => "expanded"
+        ArrowNarrowRefused       => "refused"
 
 // The names of every column of a schema that no data frame cell holds.
 //
 // The call a caller makes before it starts, so the refusal is one line
 // naming four columns rather than a failure on the eleventh.
 pub fn unsupported_columns(s: ArrowSchema) -> [Str]
-    todo("arrow-nv.arrowdf.unsupported_columns")
+    var out: [Str] = []
+    for f in s.fields
+        if cell_kind_of(f.data_type) == ArrowCellUnsupported
+            list.push(out, f.name)
+    out
 
 // Every column whose conversion loses something, with what it loses.
 pub fn lossy_columns(s: ArrowSchema) -> [Str]
-    todo("arrow-nv.arrowdf.lossy_columns")
+    var out: [Str] = []
+    for f in s.fields
+        let n = if f.dictionary != None
+            ArrowNarrowExpanded
+        else
+            narrowing_of(f.data_type)
+        if n != ArrowNarrowExact and n != ArrowNarrowRefused
+            list.push(out, "${f.name}: ${narrowing_name(n)}")
+    out
 
 // ── The sink: Arrow in, a frame out ─────────────────────────────────
 
 // What a data frame — or a result set, or anything else columnar —
 // implements to receive an Arrow batch.
 //
-// FOUR PUT METHODS, ONE PER CELL KIND, and each takes the values and
+// There are four put methods, one per cell kind, and each takes the values and
 // the presence mask as two lists rather than a list of optionals.  That
 // is the shape a columnar consumer already has (dataframe-nv's
 // `with_nulls` takes exactly this pair), it is what an Arrow validity
@@ -149,16 +187,54 @@ pub trait ArrowColumnSink
 // took only a projection function would not.
 pub fn drain_column<S: ArrowColumnSink>(body: Bytes, b: ArrowBatch, name: Str,
                                         sink: S) -> Result<S, ArrowFault>
-    todo("arrow-nv.arrowdf.drain_column")
+    let i = arrowtype.field_index(b.schema, name)
+    let a = arrowcol.column(b, name)!
+    let f = b.schema.fields[i]
+    let kind = cell_kind_of(f.data_type)
+    if kind == ArrowCellUnsupported
+        return Ok(sink.skip_column(name, "no data frame cell holds a ${arrowtype.type_name(f.data_type)} column"))
+    var present: [Bool] = []
+    for k in 0..a.length
+        list.push(present, arrowcol.is_valid(body, a, k)!)
+    match kind
+        ArrowCellFloat =>
+            var values: [Float] = []
+            for k in 0..a.length
+                list.push(values, (if present[k] then float_value(body, b, f, a, k)! else 0.0))
+            Ok(sink.put_floats(name, values, present))
+        ArrowCellInt   =>
+            var values: [Int] = []
+            for k in 0..a.length
+                list.push(values, (if present[k] then int_value(body, b, f, a, k)! else 0))
+            Ok(sink.put_ints(name, values, present))
+        ArrowCellBool  =>
+            var values: [Bool] = []
+            for k in 0..a.length
+                list.push(values, present[k] and bool_value(body, b, f, a, k)!)
+            Ok(sink.put_bools(name, values, present))
+        _              =>
+            var values: [Str] = []
+            for k in 0..a.length
+                if present[k]
+                    list.push(values, str_value(body, b, f, a, k)!)
+                else
+                    list.push(values, "")
+            Ok(sink.put_strs(name, values, present))
 
 // Drain every column of a batch into a sink, in schema order.
 pub fn drain_batch<S: ArrowColumnSink>(body: Bytes, b: ArrowBatch, sink: S) -> Result<S, ArrowFault>
-    todo("arrow-nv.arrowdf.drain_batch")
+    var cur = sink
+    for f in b.schema.fields
+        cur = drain_column(body, b, f.name, cur)!
+    Ok(cur)
 
 // Drain the columns a projection names, in the projection's order.
 pub fn drain_projection<S: ArrowColumnSink>(body: Bytes, b: ArrowBatch, names: [Str],
                                             sink: S) -> Result<S, ArrowFault>
-    todo("arrow-nv.arrowdf.drain_projection")
+    var cur = sink
+    for name in names
+        cur = drain_column(body, b, name, cur)!
+    Ok(cur)
 
 // ── The source: a frame in, Arrow out ───────────────────────────────
 
@@ -186,13 +262,24 @@ pub trait ArrowColumnSource
 // and a non-nullable field that turns out to have one is a file no
 // reader accepts.
 pub fn schema_of_source<S: ArrowColumnSource>(src: S) -> Result<ArrowSchema, ArrowFault>
-    todo("arrow-nv.arrowdf.schema_of_source")
+    var fields: [ArrowField] = []
+    for i in 0..src.column_count()
+        let t = match src.column_kind(i)
+            ArrowCellFloat       => ArrowFloat64
+            ArrowCellInt         => ArrowInt64
+            ArrowCellBool        => ArrowBool
+            ArrowCellStr         => ArrowUtf8
+            ArrowCellUnsupported =>
+                return Err(ArrowWrongType("a float, int, bool or str column", "unsupported",
+                                          arrowfault.at_field(src.column_name(i))))
+        list.push(fields, arrowtype.field(src.column_name(i), t, true))
+    Ok(arrowtype.schema(fields))
 
 // How many bytes a batch built from this source's rows will need.
 //
 // Answered before anything is built, so a caller sizes one buffer.
 pub fn body_bound_of_source<S: ArrowColumnSource>(src: S) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowdf.body_bound_of_source")
+    source_bound(src, 0, src.row_count())
 
 // Build a batch from a source, writing its body into the caller's
 // cursor.
@@ -202,8 +289,8 @@ pub fn body_bound_of_source<S: ArrowColumnSource>(src: S) -> Result<Int, ArrowFa
 // `arrowwrite.write_batch`, and the count so it knows how much of its
 // buffer is live.
 pub fn batch_of_source<S: ArrowColumnSource>(src: S,
-                                             mut dst: Cursor) -> Result<(ArrowBatch, Int), ArrowFault>
-    todo("arrow-nv.arrowdf.batch_of_source")
+                                             var dst: Cursor) -> Result<(ArrowBatch, Int), ArrowFault>
+    batch_of_source_slice(src, 0, src.row_count(), dst)
 
 // The rows `[from, from + count)` of a source as one batch.
 //
@@ -211,5 +298,148 @@ pub fn batch_of_source<S: ArrowColumnSource>(src: S,
 // stream of batches, and choosing the batch size is the caller's
 // because it is a memory decision.
 pub fn batch_of_source_slice<S: ArrowColumnSource>(src: S, from: Int, count: Int,
-                                                   mut dst: Cursor) -> Result<(ArrowBatch, Int), ArrowFault>
-    todo("arrow-nv.arrowdf.batch_of_source_slice")
+                                                   var dst: Cursor) -> Result<(ArrowBatch, Int), ArrowFault>
+    let s = schema_of_source(src)!
+    if from < 0 or count < 0 or from + count > src.row_count()
+        return Err(ArrowIndexOutOfRange(from + count, src.row_count(), arrowfault.nowhere()))
+    let need = source_bound(src, from, count)!
+    let left = dst.remaining()
+    if need > left
+        return Err(ArrowWriteBufferTooSmall(need, left, arrowfault.nowhere()))
+    var at = 0
+    var columns: [ArrowArray] = []
+    for i in 0..src.column_count()
+        let present = src.column_present(i)[from:from + count]
+        let validity = ArrowBuffer { start: at, len: arrowbuf.bitmap_bytes(count) }
+        at = at + arrowwrite.write_validity(present, dst)!
+        let nulls = count_false(present)
+        match src.column_kind(i)
+            ArrowCellFloat =>
+                let values = ArrowBuffer { start: at, len: 8 * count }
+                at = at + arrowwrite.write_floats(src.floats_at(i)[from:from + count], 64, dst)!
+                list.push(columns, arrowcol.array(ArrowFloat64, count, nulls, [validity, values]))
+            ArrowCellInt   =>
+                let values = ArrowBuffer { start: at, len: 8 * count }
+                at = at + arrowwrite.write_ints(src.ints_at(i)[from:from + count], 64, dst)!
+                list.push(columns, arrowcol.array(ArrowInt64, count, nulls, [validity, values]))
+            ArrowCellBool  =>
+                let values = ArrowBuffer { start: at, len: arrowbuf.bitmap_bytes(count) }
+                at = at + arrowwrite.write_bits(src.bools_at(i)[from:from + count], dst)!
+                list.push(columns, arrowcol.array(ArrowBool, count, nulls, [validity, values]))
+            _              =>
+                let texts = src.strs_at(i)[from:from + count]
+                var lengths: [Int] = []
+                var total = 0
+                for t in texts
+                    list.push(lengths, str.len(t))
+                    total = total + str.len(t)
+                let offsets = ArrowBuffer { start: at, len: 4 * (count + 1) }
+                at = at + arrowwrite.write_offsets32(lengths, dst)!
+                let values = ArrowBuffer { start: at, len: total }
+                for t in texts
+                    dst.put_bytes(bytes.from_str(t))
+                at = at + total
+                at = at + arrowwrite.write_padding(total, dst)!
+                list.push(columns, arrowcol.array(ArrowUtf8, count, nulls, [validity, offsets, values]))
+    Ok((arrowcol.batch(s, columns, count), at))
+
+fn fixed_binary(t: ArrowType) -> Bool
+    match t
+        ArrowFixedSizeBinary(_) => true
+        _                       => false
+
+fn count_false(flags: [Bool]) -> Int
+    var n = 0
+    for f in flags
+        if not f
+            n = n + 1
+    n
+
+// The bytes rows `[from, from + count)` of a source take as a batch body.
+fn source_bound<S: ArrowColumnSource>(src: S, from: Int, count: Int) -> Result<Int, ArrowFault>
+    var n = 0
+    for i in 0..src.column_count()
+        n = n + arrowbuf.bitmap_bytes(count)
+        match src.column_kind(i)
+            ArrowCellFloat       =>
+                n = n + arrowbuf.padded_len(8 * count)
+            ArrowCellInt         =>
+                n = n + arrowbuf.padded_len(8 * count)
+            ArrowCellBool        =>
+                n = n + arrowbuf.bitmap_bytes(count)
+            ArrowCellStr         =>
+                var total = 0
+                for t in src.strs_at(i)[from:from + count]
+                    total = total + str.len(t)
+                n = n + arrowbuf.padded_len(4 * (count + 1)) + arrowbuf.padded_len(total)
+            ArrowCellUnsupported =>
+                return Err(ArrowWrongType("a float, int, bool or str column", "unsupported",
+                                          arrowfault.at_field(src.column_name(i))))
+    Ok(n)
+
+// Where element `k` of a column is read from: the array, the element
+// in it, and which dictionary entry's body holds it, or -1 for the
+// batch's own body.  A dictionary-encoded column reads its values from
+// the dictionary.
+fn source_of(body: Bytes, b: ArrowBatch, f: ArrowField, a: ArrowArray,
+             k: Int) -> Result<(ArrowArray, Int, Int), ArrowFault>
+    if f.dictionary == None
+        return Ok((a, k, -1))
+    let index = arrowcol.int_at(body, a, k)!
+    var rest = index
+    var size = 0
+    for e in 0..list.len(b.dictionaries)
+        let d = b.dictionaries[e]
+        if d.id == a.dictionary_id
+            if rest >= 0 and rest < d.values.length
+                return Ok((d.values, rest, e))
+            rest = rest - d.values.length
+            size = size + d.values.length
+    if size == 0
+        return Err(ArrowDictionaryMissing(a.dictionary_id, arrowfault.at_field(f.name)))
+    Err(ArrowDictionaryIndexOutOfRange(index, size, arrowfault.at_field(f.name)))
+
+fn float_value(body: Bytes, b: ArrowBatch, f: ArrowField, a: ArrowArray,
+               k: Int) -> Result<Float, ArrowFault>
+    let (arr, at, e) = source_of(body, b, f, a, k)!
+    let src = if e < 0
+        body
+    else
+        b.dictionaries[e].body
+    match arr.data_type
+        ArrowDecimal128(_, scale) => Ok(decimal(src, arrowcol.decimal_bytes_at(src, arr, at)!, scale))
+        ArrowDecimal256(_, scale) => Ok(decimal(src, arrowcol.decimal_bytes_at(src, arr, at)!, scale))
+        _                         => arrowcol.float_at(src, arr, at)
+
+fn int_value(body: Bytes, b: ArrowBatch, f: ArrowField, a: ArrowArray,
+             k: Int) -> Result<Int, ArrowFault>
+    let (arr, at, e) = source_of(body, b, f, a, k)!
+    arrowcol.int_at((if e < 0 then body else b.dictionaries[e].body), arr, at)
+
+fn bool_value(body: Bytes, b: ArrowBatch, f: ArrowField, a: ArrowArray,
+              k: Int) -> Result<Bool, ArrowFault>
+    let (arr, at, e) = source_of(body, b, f, a, k)!
+    arrowcol.bool_at((if e < 0 then body else b.dictionaries[e].body), arr, at)
+
+fn str_value(body: Bytes, b: ArrowBatch, f: ArrowField, a: ArrowArray,
+             k: Int) -> Result<Str, ArrowFault>
+    let (arr, at, e) = source_of(body, b, f, a, k)!
+    arrowcol.str_at((if e < 0 then body else b.dictionaries[e].body), arr, at)
+
+// A little-endian two's-complement decimal, scaled by `10^-scale`, as
+// the nearest float the arithmetic reaches.  A negative value is read
+// through its complement, so that its magnitude is summed rather than
+// cancelled.
+fn decimal(body: Bytes, span: ArrowBuffer, scale: Int) -> Float
+    let negative = (bytes.byte_at(body, span.start + span.len - 1) ?? 0) >= 128
+    var v = 0.0
+    var weight = 1.0
+    for k in 0..span.len
+        let b = bytes.byte_at(body, span.start + k) ?? 0
+        v = v + int.to_float((if negative then 255 - b else b)) * weight
+        weight = weight * 256.0
+    if negative
+        v = 0.0 - (v + 1.0)
+    for _ in 0..scale
+        v = v / 10.0
+    v

@@ -1,31 +1,27 @@
 // arrowfault.nv — why a schema, a batch or a stream was refused, and
 // where.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// A fault names three places, because an Arrow fault is seldom noticed
+// where it is.  A record batch is a flat list of buffers matched to a
+// tree of fields, so "buffer 11 is four bytes short" says little on its
+// own, and "field `orders.items.price`, buffer 11, at body offset 4096"
+// can be acted on.  `ArrowWhere` carries the message, the field path,
+// the buffer index and the byte offset.
 //
-// A FAULT NAMES THREE PLACES, because an Arrow fault is almost never
-// where it is noticed.  A record batch is a flat list of buffers
-// re-associated with a tree of fields, so "buffer 11 is four bytes
-// short" is useless on its own and "field `orders.items.price`,
-// validity buffer, at body offset 4096, wanted 512 bytes and the body
-// has 240" is a report somebody can act on.  `ArrowWhere` carries the
-// field path, the buffer's role and the byte offset, and every variant
-// below that can name a position carries one.
+// Every fault is one of three kinds, and a caller reacts to each
+// differently:
 //
-// The faults split into three kinds and the split is worth stating,
-// because a caller reacts to them differently:
+// - Incomplete: the bytes are fine so far and there are not enough of
+//   them.  A reader answers this by asking for more.
+// - Corrupt: the bytes contradict the format.  Neither a retry nor more
+//   input helps.
+// - Unsupported: the bytes are valid Arrow that this package does not
+//   read, such as a run-end-encoded column.  The producer is not at
+//   fault.
 //
-//   INCOMPLETE   — the bytes are fine so far and there are not enough
-//                  of them yet.  A feed-and-drain reader answers this
-//                  by asking for more, and `is_incomplete` is how a
-//                  caller tells "feed me" from "give up".
-//   CORRUPT      — the bytes contradict the format.  Retrying will not
-//                  help and neither will more input.
-//   UNSUPPORTED  — the bytes are valid Arrow that this package does
-//                  not read.  A separate kind on purpose: a consumer
-//                  that treats a run-end-encoded column as corruption
-//                  reports a bug against the producer, and the producer
-//                  is right.
+// A write that does not fit its cursor is none of the three causes and
+// is classed as unsupported, so that neither `is_incomplete` nor
+// `is_corrupt` is true of it.
 
 // Where in a stream, a schema and a body a fault was found.
 //
@@ -53,20 +49,20 @@ pub struct ArrowWhere
 // A position with no field and no buffer — for a fault in the framing
 // rather than in a column.
 pub fn at_byte(message: Int, at: Int) -> ArrowWhere
-    todo("arrow-nv.arrowfault.at_byte")
+    ArrowWhere { message: message, path: "", buffer: -1, at: at }
 
 // A position inside one field's one buffer.
 pub fn at_buffer(message: Int, path: Str, buffer: Int, at: Int) -> ArrowWhere
-    todo("arrow-nv.arrowfault.at_buffer")
+    ArrowWhere { message: message, path: path, buffer: buffer, at: at }
 
 // A position that names only a field — for a schema fault, where there
 // is no body yet.
 pub fn at_field(path: Str) -> ArrowWhere
-    todo("arrow-nv.arrowfault.at_field")
+    ArrowWhere { message: -1, path: path, buffer: -1, at: -1 }
 
 // The position for a value the caller built rather than read.
 pub fn nowhere() -> ArrowWhere
-    todo("arrow-nv.arrowfault.nowhere")
+    ArrowWhere { message: -1, path: "", buffer: -1, at: -1 }
 
 // Which of the three kinds a fault is.
 pub enum ArrowFaultKind
@@ -103,7 +99,7 @@ pub enum ArrowFault
     ArrowEndianMismatch(at: ArrowWhere)
     // A type code in the schema that is not in this package's set.
     ArrowUnknownType(code: Int, at: ArrowWhere)
-    // A type that IS in the spec and is not read here — the view
+    // A type that is in the spec and is not read here — the view
     // layouts, run-end encoding, and the two tensor message kinds.
     // Named separately from corruption on purpose.
     ArrowTypeUnsupported(name: Str, at: ArrowWhere)
@@ -169,6 +165,19 @@ pub enum ArrowFault
     // A caller built an array whose buffer list does not match its own
     // type's layout.  Answered by `arrowcol.validate`, never by a read.
     ArrowLayoutMismatch(want: Int, got: Int, at: ArrowWhere)
+    // A type whose parameters the specification does not allow: a
+    // `Time32` in microseconds, a map whose entries may be null, a
+    // dictionary indexed by a string.  `what` says which rule.
+    ArrowTypeInvalid(what: Str, at: ArrowWhere)
+    // A buffer that does not start on the required eight-byte boundary.
+    // Answered by `arrowbuf.check_alignment`, never by a read.
+    ArrowMisaligned(start: Int, at: ArrowWhere)
+    // A column whose length is not the batch's row count, or a struct
+    // child shorter than its struct.
+    ArrowLengthMismatch(want: Int, got: Int, at: ArrowWhere)
+    // A read of one kind of value from a column of another: `int_at` on
+    // a `Utf8` column, `child_range` on an `Int32` one.
+    ArrowWrongType(want: Str, got: Str, at: ArrowWhere)
 
 // The standard `Error` implementation, so a refused batch is reported
 // by anything that reports errors.
@@ -186,11 +195,79 @@ impl Error for ArrowFault
     // body nobody has a dump of is not actionable, and
     // `orders.items.price` is.
     fn message(self) -> Str
-        todo("arrow-nv.arrowfault.ArrowFault.message")
+        let what = match self
+            ArrowShortBody(want, have, _)                     =>
+                "the body ends after ${have} byte(s) where ${want} are needed"
+            ArrowShortMetadata(want, have, _)                 =>
+                "the metadata ends after ${have} byte(s) where ${want} are needed"
+            ArrowBadContinuation(saw, _)                      =>
+                "the continuation marker is ${saw}, not 0xFFFFFFFF"
+            ArrowBadMagic(_)                                  =>
+                "the ARROW1 magic is missing"
+            ArrowFooterNotFound(_)                            =>
+                "the file footer is not where its length says"
+            ArrowVersionUnsupported(version, _)               =>
+                "metadata version ${version} is not read here"
+            ArrowEndianMismatch(_)                            =>
+                "the buffers are big-endian"
+            ArrowUnknownType(code, _)                         =>
+                "type code ${code} is not an Arrow type"
+            ArrowTypeUnsupported(name, _)                     =>
+                "the type ${name} is valid Arrow that this package does not read"
+            ArrowChildCountWrong(want, got, _)                =>
+                "${got} child field(s) where the type takes ${want}"
+            ArrowBufferCountWrong(want, got, _)               =>
+                "${got} buffer(s) where the schema's walk takes ${want}"
+            ArrowNodeCountWrong(want, got, _)                 =>
+                "${got} field node(s) where the schema's walk takes ${want}"
+            ArrowOffsetsNotAscending(index, previous, saw, _) =>
+                "offset ${index} is ${saw}, below the one before it, ${previous}"
+            ArrowOffsetPastEnd(index, offset, values_len, _)  =>
+                "offset ${index} is ${offset}, past the ${values_len}-byte values buffer"
+            ArrowNegativeLength(saw, _)                       =>
+                "a length or null count of ${saw}"
+            ArrowIndexOutOfRange(index, length, _)            =>
+                "index ${index} is outside an array of length ${length}"
+            ArrowDictionaryMissing(id, _)                     =>
+                "dictionary ${id} has not been seen"
+            ArrowDictionaryTypeWrong(id, _)                   =>
+                "dictionary ${id} holds values of another type than its field"
+            ArrowDictionaryIndexOutOfRange(index, size, _)    =>
+                "dictionary index ${index} is outside a dictionary of ${size}"
+            ArrowUnionTypeIdUnknown(type_id, _)               =>
+                "union type id ${type_id} is not one of the field's"
+            ArrowDecimalOutOfRange(precision, scale, _)       =>
+                "a decimal of precision ${precision} and scale ${scale}"
+            ArrowNotUtf8(index, _)                            =>
+                "value ${index} is not UTF-8"
+            ArrowBadFixedWidth(width, _)                      =>
+                "a fixed width of ${width}"
+            ArrowDuplicateName(name, _)                       =>
+                "the name `${name}` appears twice"
+            ArrowUnexpectedMessage(saw, wanted, _)            =>
+                "a ${saw} message where a ${wanted} message belongs"
+            ArrowMessageTooLarge(want, limit, _)              =>
+                "a message of ${want} byte(s) is over the limit of ${limit}"
+            ArrowWriteBufferTooSmall(want, have, _)           =>
+                "the write needs ${want} byte(s) and the destination has ${have}"
+            ArrowLayoutMismatch(want, got, _)                 =>
+                "${got} buffer(s) where the type's layout has ${want}"
+            ArrowTypeInvalid(what, _)                         =>
+                "${what} is not a valid Arrow type"
+            ArrowMisaligned(start, _)                         =>
+                "a buffer at byte ${start} is not on an eight-byte boundary"
+            ArrowLengthMismatch(want, got, _)                 =>
+                "an array of length ${got} where ${want} is needed"
+            ArrowWrongType(want, got, _)                      =>
+                "a ${got} column where ${want} is needed"
+        let place = where_text(where_of(self))
+        if place == ""
+            return "arrow: ${what}"
+        "arrow: ${what} (${place})"
 
 // A short body, built.
 pub fn short_body(want: Int, have: Int, at: ArrowWhere) -> ArrowFault
-    todo("arrow-nv.arrowfault.short_body")
+    ArrowShortBody(want, have, at)
 
 // Which of the three kinds this fault is.
 //
@@ -199,29 +276,80 @@ pub fn short_body(want: Int, have: Int, at: ArrowWhere) -> ArrowFault
 // producer on `ArrowCorrupt`, and reports itself on
 // `ArrowUnsupported`.
 pub fn kind_of(f: ArrowFault) -> ArrowFaultKind
-    todo("arrow-nv.arrowfault.kind_of")
+    match f
+        ArrowShortBody(_, _, _)           => ArrowIncomplete
+        ArrowShortMetadata(_, _, _)       => ArrowIncomplete
+        ArrowVersionUnsupported(_, _)     => ArrowUnsupported
+        ArrowEndianMismatch(_)            => ArrowUnsupported
+        ArrowTypeUnsupported(_, _)        => ArrowUnsupported
+        ArrowWriteBufferTooSmall(_, _, _) => ArrowUnsupported
+        _                                 => ArrowCorrupt
 
 // Whether more bytes could still make this succeed.
 pub fn is_incomplete(f: ArrowFault) -> Bool
-    todo("arrow-nv.arrowfault.is_incomplete")
+    kind_of(f) == ArrowIncomplete
 
 // Whether the bytes contradict the format.
 pub fn is_corrupt(f: ArrowFault) -> Bool
-    todo("arrow-nv.arrowfault.is_corrupt")
+    kind_of(f) == ArrowCorrupt
 
 // Where the fault was found.
 pub fn where_of(f: ArrowFault) -> ArrowWhere
-    todo("arrow-nv.arrowfault.where_of")
+    match f
+        ArrowShortBody(_, _, w)                 => w
+        ArrowShortMetadata(_, _, w)             => w
+        ArrowBadContinuation(_, w)              => w
+        ArrowBadMagic(w)                        => w
+        ArrowFooterNotFound(w)                  => w
+        ArrowVersionUnsupported(_, w)           => w
+        ArrowEndianMismatch(w)                  => w
+        ArrowUnknownType(_, w)                  => w
+        ArrowTypeUnsupported(_, w)              => w
+        ArrowChildCountWrong(_, _, w)           => w
+        ArrowBufferCountWrong(_, _, w)          => w
+        ArrowNodeCountWrong(_, _, w)            => w
+        ArrowOffsetsNotAscending(_, _, _, w)    => w
+        ArrowOffsetPastEnd(_, _, _, w)          => w
+        ArrowNegativeLength(_, w)               => w
+        ArrowIndexOutOfRange(_, _, w)           => w
+        ArrowDictionaryMissing(_, w)            => w
+        ArrowDictionaryTypeWrong(_, w)          => w
+        ArrowDictionaryIndexOutOfRange(_, _, w) => w
+        ArrowUnionTypeIdUnknown(_, w)           => w
+        ArrowDecimalOutOfRange(_, _, w)         => w
+        ArrowNotUtf8(_, w)                      => w
+        ArrowBadFixedWidth(_, w)                => w
+        ArrowDuplicateName(_, w)                => w
+        ArrowUnexpectedMessage(_, _, w)         => w
+        ArrowMessageTooLarge(_, _, w)           => w
+        ArrowWriteBufferTooSmall(_, _, w)       => w
+        ArrowLayoutMismatch(_, _, w)            => w
+        ArrowTypeInvalid(_, w)                  => w
+        ArrowMisaligned(_, w)                   => w
+        ArrowLengthMismatch(_, _, w)            => w
+        ArrowWrongType(_, _, w)                 => w
 
 // The position as one line — `message 3, orders.items.price, buffer 11,
 // byte 4096` — with the absent coordinates left out rather than printed
 // as `-1`.
 pub fn where_text(w: ArrowWhere) -> Str
-    todo("arrow-nv.arrowfault.where_text")
+    var parts: [Str] = []
+    if w.message >= 0
+        list.push(parts, "message ${w.message}")
+    if w.path != ""
+        list.push(parts, w.path)
+    if w.buffer >= 0
+        list.push(parts, "buffer ${w.buffer}")
+    if w.at >= 0
+        list.push(parts, "byte ${w.at}")
+    list.join(parts, ", ")
 
 // The kind's name, for a log line that groups faults.
 pub fn kind_name(k: ArrowFaultKind) -> Str
-    todo("arrow-nv.arrowfault.kind_name")
+    match k
+        ArrowIncomplete  => "incomplete"
+        ArrowCorrupt     => "corrupt"
+        ArrowUnsupported => "unsupported"
 
 // A fault re-pointed at a field, for a caller that caught one from a
 // child array and knows the parent's name.
@@ -231,4 +359,67 @@ pub fn kind_name(k: ArrowFaultKind) -> Str
 // down, which is also what keeps `ArrowArray` free of a name field it
 // would have to keep in step with the schema.
 pub fn under(f: ArrowFault, parent: Str) -> ArrowFault
-    todo("arrow-nv.arrowfault.under")
+    let w = where_of(f)
+    let dotted = if w.path == ""
+        parent
+    else
+        "${parent}.${w.path}"
+    with_where(f, ArrowWhere { message: w.message, path: dotted, buffer: w.buffer, at: w.at })
+
+// The same fault with its message index set and its byte offset counted
+// from `base`.
+//
+// A message is read by offsets into the chunk it arrived in, so a
+// reader that knows the message's index and where the chunk sits in the
+// stream moves the fault's coordinates onto the stream with this.
+//
+// ```novo
+// use arrowfault
+//
+// fn main() [io]
+//     let f = arrowfault.short_body(512, 240, arrowfault.at_byte(-1, 16))
+//     println(arrowfault.where_text(arrowfault.where_of(arrowfault.in_message(f, 3, 1000))))
+// ```
+pub fn in_message(f: ArrowFault, message: Int, base: Int) -> ArrowFault
+    let w = where_of(f)
+    let at = if w.at >= 0
+        w.at + base
+    else
+        w.at
+    with_where(f, ArrowWhere { message: message, path: w.path, buffer: w.buffer, at: at })
+
+// The same fault at another position.
+fn with_where(f: ArrowFault, w: ArrowWhere) -> ArrowFault
+    match f
+        ArrowShortBody(a, b, _)                 => ArrowShortBody(a, b, w)
+        ArrowShortMetadata(a, b, _)             => ArrowShortMetadata(a, b, w)
+        ArrowBadContinuation(a, _)              => ArrowBadContinuation(a, w)
+        ArrowBadMagic(_)                        => ArrowBadMagic(w)
+        ArrowFooterNotFound(_)                  => ArrowFooterNotFound(w)
+        ArrowVersionUnsupported(a, _)           => ArrowVersionUnsupported(a, w)
+        ArrowEndianMismatch(_)                  => ArrowEndianMismatch(w)
+        ArrowUnknownType(a, _)                  => ArrowUnknownType(a, w)
+        ArrowTypeUnsupported(a, _)              => ArrowTypeUnsupported(a, w)
+        ArrowChildCountWrong(a, b, _)           => ArrowChildCountWrong(a, b, w)
+        ArrowBufferCountWrong(a, b, _)          => ArrowBufferCountWrong(a, b, w)
+        ArrowNodeCountWrong(a, b, _)            => ArrowNodeCountWrong(a, b, w)
+        ArrowOffsetsNotAscending(a, b, c, _)    => ArrowOffsetsNotAscending(a, b, c, w)
+        ArrowOffsetPastEnd(a, b, c, _)          => ArrowOffsetPastEnd(a, b, c, w)
+        ArrowNegativeLength(a, _)               => ArrowNegativeLength(a, w)
+        ArrowIndexOutOfRange(a, b, _)           => ArrowIndexOutOfRange(a, b, w)
+        ArrowDictionaryMissing(a, _)            => ArrowDictionaryMissing(a, w)
+        ArrowDictionaryTypeWrong(a, _)          => ArrowDictionaryTypeWrong(a, w)
+        ArrowDictionaryIndexOutOfRange(a, b, _) => ArrowDictionaryIndexOutOfRange(a, b, w)
+        ArrowUnionTypeIdUnknown(a, _)           => ArrowUnionTypeIdUnknown(a, w)
+        ArrowDecimalOutOfRange(a, b, _)         => ArrowDecimalOutOfRange(a, b, w)
+        ArrowNotUtf8(a, _)                      => ArrowNotUtf8(a, w)
+        ArrowBadFixedWidth(a, _)                => ArrowBadFixedWidth(a, w)
+        ArrowDuplicateName(a, _)                => ArrowDuplicateName(a, w)
+        ArrowUnexpectedMessage(a, b, _)         => ArrowUnexpectedMessage(a, b, w)
+        ArrowMessageTooLarge(a, b, _)           => ArrowMessageTooLarge(a, b, w)
+        ArrowWriteBufferTooSmall(a, b, _)       => ArrowWriteBufferTooSmall(a, b, w)
+        ArrowLayoutMismatch(a, b, _)            => ArrowLayoutMismatch(a, b, w)
+        ArrowTypeInvalid(a, _)                  => ArrowTypeInvalid(a, w)
+        ArrowMisaligned(a, _)                   => ArrowMisaligned(a, w)
+        ArrowLengthMismatch(a, b, _)            => ArrowLengthMismatch(a, b, w)
+        ArrowWrongType(a, b, _)                 => ArrowWrongType(a, b, w)

@@ -1,41 +1,34 @@
-// arrowbuf.nv — a buffer as a SPAN into bytes the caller owns, and the
+// arrowbuf.nv — a buffer as a span into bytes the caller owns, and the
 // bit and offset arithmetic that reads one.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// A buffer is two integers, a start and a length, into one body the
+// caller holds: the `Bytes` that came off a socket or out of a file.
+// Every accessor in this package takes that body beside the array.  So
+// a read allocates nothing, a slice shares its parent's buffers, and a
+// million-row batch reaches a caller as one `Bytes` and a tree of small
+// structs.
 //
-// A BUFFER IS TWO INTEGERS.  Arrow's whole argument is that a column is
-// already laid out the way a machine wants to read it, so copying it
-// into a novo-lang list to answer a question about it would spend
-// exactly what the format exists to save.  `ArrowBuffer` is therefore
-// `(start, len)` into ONE body the caller holds — the `Bytes` that came
-// off a socket, out of a file, or out of a mapped page — and every
-// accessor in this package takes that body beside the array.
+// Every bit index is `array.offset + i`, never `i`.  A validity bitmap
+// is bit-addressed from the start of the array, and an array carries an
+// offset into buffers it shares with its parent, so element 0 of a
+// sliced array is bit `offset` of the bitmap.  That is why
+// `arrowcol.is_valid` takes the array and not the buffer.
 //
-// The consequences are worth being explicit about, because they are the
-// package's shape:
+// Bits are numbered least significant first within each byte (the
+// columnar specification, "Validity bitmaps").  Integers and offsets
+// are little-endian.
 //
-//   - This package never allocates on a read.  A million-row batch
-//     reaches a caller as one `Bytes` it already had plus a tree of
-//     small structs.
-//   - `arrowcol.slice` is free.  A slice shares its parent's buffers
-//     and changes only `offset` and `length`.
-//   - There is nothing to map and nothing to free, which is why a
-//     `core` budget is honest here rather than arranged.
-//
-// EVERY BIT INDEX IS `array.offset + i`, NEVER `i`.  A validity bitmap
-// is bit-addressed from the START OF THE ARRAY, and an Arrow array
-// carries an `offset` into buffers it shares with its parent.  So
-// element 0 of a sliced array is bit `offset` of the bitmap, and a
-// reader that indexes the bitmap directly reads its parent's nulls.
-// That is why `is_valid` takes the ARRAY and not the buffer: there is
-// no spelling of this accessor that lets a caller forget the offset.
-//
-// ALIGNMENT AND PADDING ARE THE PRODUCER'S PROBLEM, NOT THE READER'S.
-// The IPC specification requires every buffer to start on an 8-byte
-// boundary and pads message metadata to 8, with 64 recommended for the
-// buffers themselves.  A reader that REFUSED a misaligned buffer would
-// refuse real files, so `check_alignment` is a separate call a producer
-// can run and a reader need not; the accessors read unaligned.
+// Alignment and padding are the producer's concern.  The IPC
+// specification requires every buffer to start on an eight-byte
+// boundary and recommends sixty-four.  A reader that refused a
+// misaligned buffer would refuse real files, so `check_alignment` is a
+// separate call, and the accessors read unaligned.
+
+use std.bytes
+use std.float
+use std.list
+use arrowfault
+use arrowtype
 
 // A span into the body the caller owns.
 //
@@ -48,12 +41,12 @@ pub struct ArrowBuffer
     // Byte offset into the message body.
     start: Int
     // Length in bytes, as the metadata declared it.  This is the
-    // DECLARED length: it may be padded past the data, and for a
+    // declared length: it may be padded past the data, and for a
     // validity buffer it may be zero, which means "no nulls" rather
     // than "no buffer".
     len: Int
 
-// What a buffer at a given position in an array's buffer list MEANS.
+// What a buffer at a given position in an array's buffer list means.
 //
 // The list's positions are fixed by the type, so a role is a function
 // of `(type, index)` and not something the format records.  Naming them
@@ -82,7 +75,7 @@ pub enum ArrowBufferRole
 
 // The roles of an array of this type, in the order the buffers appear.
 //
-// THE LOAD-BEARING TABLE OF THIS MODULE, and the companion to
+// The table this module is built on, and the companion to
 // `arrowtype.buffer_count_of`: that one says how many, this one says
 // which.  The empty list for `ArrowNull`, `[ArrowValidityRole,
 // ArrowBitsRole]` for `ArrowBool`, `[ArrowTypeIdRole,
@@ -97,73 +90,104 @@ pub enum ArrowBufferRole
 //     println("${list.len(arrowbuf.layout_of(ArrowUtf8))}")
 // ```
 pub fn layout_of(t: ArrowType) -> [ArrowBufferRole]
-    todo("arrow-nv.arrowbuf.layout_of")
+    match t
+        ArrowNull                    => []
+        ArrowBool                    => [ArrowValidityRole, ArrowBitsRole]
+        ArrowUtf8                    => [ArrowValidityRole, ArrowOffset32Role, ArrowValuesRole]
+        ArrowBinary                  => [ArrowValidityRole, ArrowOffset32Role, ArrowValuesRole]
+        ArrowLargeUtf8               => [ArrowValidityRole, ArrowOffset64Role, ArrowValuesRole]
+        ArrowLargeBinary             => [ArrowValidityRole, ArrowOffset64Role, ArrowValuesRole]
+        ArrowList                    => [ArrowValidityRole, ArrowOffset32Role]
+        ArrowMap(_)                  => [ArrowValidityRole, ArrowOffset32Role]
+        ArrowLargeList               => [ArrowValidityRole, ArrowOffset64Role]
+        ArrowFixedSizeList(_)        => [ArrowValidityRole]
+        ArrowStruct                  => [ArrowValidityRole]
+        ArrowUnion(ArrowSparseUnion) => [ArrowTypeIdRole]
+        ArrowUnion(ArrowDenseUnion)  => [ArrowTypeIdRole, ArrowUnionOffsetRole]
+        _                            => [ArrowValidityRole, ArrowValuesRole]
 
 // The role at a position, or a fault when the type has no buffer there.
 pub fn role_at(t: ArrowType, index: Int) -> Result<ArrowBufferRole, ArrowFault>
-    todo("arrow-nv.arrowbuf.role_at")
+    let roles = layout_of(t)
+    if index < 0 or index >= list.len(roles)
+        return Err(ArrowIndexOutOfRange(index, list.len(roles), arrowfault.nowhere()))
+    Ok(roles[index])
 
 // The role's name, for a fault report and for a dump.
 pub fn role_name(r: ArrowBufferRole) -> Str
-    todo("arrow-nv.arrowbuf.role_name")
+    match r
+        ArrowValidityRole    => "validity"
+        ArrowOffset32Role    => "offsets"
+        ArrowOffset64Role    => "large offsets"
+        ArrowValuesRole      => "values"
+        ArrowBitsRole        => "bits"
+        ArrowTypeIdRole      => "type ids"
+        ArrowUnionOffsetRole => "union offsets"
 
 // A span.
 pub fn buffer(start: Int, len: Int) -> ArrowBuffer
-    todo("arrow-nv.arrowbuf.buffer")
+    ArrowBuffer { start: start, len: len }
 
 // The empty span, which is what an absent validity bitmap is.
 pub fn no_buffer() -> ArrowBuffer
-    todo("arrow-nv.arrowbuf.no_buffer")
+    ArrowBuffer { start: 0, len: 0 }
 
 // One past the last byte of a span.
 pub fn end_of(b: ArrowBuffer) -> Int
-    todo("arrow-nv.arrowbuf.end_of")
+    b.start + b.len
 
 // Whether the body is long enough to hold this span.
 pub fn fits(body: Bytes, b: ArrowBuffer) -> Bool
-    todo("arrow-nv.arrowbuf.fits")
+    b.start >= 0 and b.len >= 0 and b.start + b.len <= bytes.len(body)
 
 // The alignment the IPC specification requires of a buffer's start —
 // eight bytes.
 pub fn alignment() -> Int
-    todo("arrow-nv.arrowbuf.alignment")
+    8
 
-// The alignment the specification RECOMMENDS — sixty-four, so a buffer
+// The alignment the specification recommends — sixty-four, so a buffer
 // starts on a cache line and on every vector width in use.
 pub fn preferred_alignment() -> Int
-    todo("arrow-nv.arrowbuf.preferred_alignment")
+    64
 
 // `n` rounded up to the next multiple of `alignment()`.
 //
 // What a writer adds after every buffer, and what `arrowwrite` sizes
 // with.
 pub fn padded_len(n: Int) -> Int
-    todo("arrow-nv.arrowbuf.padded_len")
+    (n + 7) / 8 * 8
 
 // How many bytes a validity bitmap for `n` elements needs — `n`
 // bits rounded up to a byte and then to the alignment.
 pub fn bitmap_bytes(n: Int) -> Int
-    todo("arrow-nv.arrowbuf.bitmap_bytes")
+    padded_len((n + 7) / 8)
 
 // Whether every buffer in a list starts on the required boundary.
 //
-// A PRODUCER'S check, not a reader's: the accessors here read unaligned
+// A producer's check, not a reader's: the accessors here read unaligned
 // and a reader that refused a misaligned file would refuse files that
 // exist.  Run it in a writer's test suite and in a tool that audits
 // somebody else's output.
 pub fn check_alignment(buffers: [ArrowBuffer]) -> [ArrowFault]
-    todo("arrow-nv.arrowbuf.check_alignment")
+    var faults: [ArrowFault] = []
+    for i in 0..list.len(buffers)
+        let b = buffers[i]
+        if b.start % 8 != 0
+            list.push(faults, ArrowMisaligned(b.start, arrowfault.at_buffer(-1, "", i, b.start)))
+    faults
 
 // ── Bitmaps ─────────────────────────────────────────────────────────
 
 // Bit `i` of a bitmap buffer, counted from the buffer's own start.
 //
-// The RAW accessor, and the one a caller should almost never reach for:
+// The raw accessor, and the one a caller should almost never reach for:
 // an element's bit is `array.offset + i`, and `arrowcol.is_valid` is
 // the call that knows that.  Published because a writer building a
 // bitmap has no array yet.
 pub fn bit_at(body: Bytes, b: ArrowBuffer, i: Int) -> Bool
-    todo("arrow-nv.arrowbuf.bit_at")
+    if i < 0 or i >= b.len * 8
+        return false
+    ((byte(body, b.start + i / 8) >> (i % 8)) & 1) == 1
 
 // Bit `i` with a default for a zero-length buffer.
 //
@@ -172,7 +196,9 @@ pub fn bit_at(body: Bytes, b: ArrowBuffer, i: Int) -> Bool
 // for the same missing buffer, and the default is an argument rather
 // than a rule.
 pub fn bit_at_or(body: Bytes, b: ArrowBuffer, i: Int, absent: Bool) -> Bool
-    todo("arrow-nv.arrowbuf.bit_at_or")
+    if b.len == 0
+        return absent
+    bit_at(body, b, i)
 
 // How many bits are set in `[from, from + count)`.
 //
@@ -181,7 +207,11 @@ pub fn bit_at_or(body: Bytes, b: ArrowBuffer, i: Int, absent: Bool) -> Bool
 // is why a sliced array's null count is `-1` ("unknown") rather than a
 // wrong number.
 pub fn count_set(body: Bytes, b: ArrowBuffer, from: Int, count: Int) -> Int
-    todo("arrow-nv.arrowbuf.count_set")
+    var n = 0
+    for i in from..from + count
+        if bit_at(body, b, i)
+            n = n + 1
+    n
 
 // The byte a run of eight bits sits in, and the bit's position in it.
 //
@@ -189,21 +219,25 @@ pub fn count_set(body: Bytes, b: ArrowBuffer, from: Int, count: Int) -> Int
 // that makes two implementations disagree, and a caller writing a
 // bitmap by hand should use this rather than re-derive it.
 pub fn bit_position(i: Int) -> (Int, Int)
-    todo("arrow-nv.arrowbuf.bit_position")
+    (i / 8, i % 8)
 
 // A bitmap byte with bit `i` set, for a writer.
 pub fn with_bit(byte_value: Int, i: Int, set: Bool) -> Int
-    todo("arrow-nv.arrowbuf.with_bit")
+    let mask = 1 << (i % 8)
+    if set
+        byte_value | mask
+    else
+        byte_value & (255 - mask)
 
 // ── Offsets ─────────────────────────────────────────────────────────
 
 // Entry `i` of a 32-bit offsets buffer.
 pub fn offset32_at(body: Bytes, b: ArrowBuffer, i: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowbuf.offset32_at")
+    int_at(body, b, i, 4)
 
 // Entry `i` of a 64-bit offsets buffer.
 pub fn offset64_at(body: Bytes, b: ArrowBuffer, i: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowbuf.offset64_at")
+    int_at(body, b, i, 8)
 
 // The span element `i` of a variable-width array covers, in the values
 // buffer.
@@ -215,7 +249,15 @@ pub fn offset64_at(body: Bytes, b: ArrowBuffer, i: Int) -> Result<Int, ArrowFaul
 // this argument exists to make impossible to reach by accident.
 pub fn value_span(body: Bytes, offsets: ArrowBuffer, i: Int,
                   large: Bool) -> Result<ArrowBuffer, ArrowFault>
-    todo("arrow-nv.arrowbuf.value_span")
+    let width = if large
+        8
+    else
+        4
+    let first = int_at(body, offsets, i, width)!
+    let next = int_at(body, offsets, i + 1, width)!
+    if next < first
+        return Err(ArrowOffsetsNotAscending(i + 1, first, next, arrowfault.nowhere()))
+    Ok(ArrowBuffer { start: first, len: next - first })
 
 // Whether an offsets buffer ascends and ends within the values buffer.
 //
@@ -225,7 +267,24 @@ pub fn value_span(body: Bytes, offsets: ArrowBuffer, i: Int,
 // per column.
 pub fn check_offsets(body: Bytes, offsets: ArrowBuffer, values_len: Int, length: Int, offset: Int,
                      large: Bool) -> [ArrowFault]
-    todo("arrow-nv.arrowbuf.check_offsets")
+    let width = if large
+        8
+    else
+        4
+    var faults: [ArrowFault] = []
+    var previous = -1
+    for j in offset..offset + length + 1
+        match int_at(body, offsets, j, width)
+            Err(f) =>
+                list.push(faults, f)
+                return faults
+            Ok(v)  =>
+                if previous >= 0 and v < previous
+                    list.push(faults, ArrowOffsetsNotAscending(j, previous, v, arrowfault.nowhere()))
+                if v > values_len or v < 0
+                    list.push(faults, ArrowOffsetPastEnd(j, v, values_len, arrowfault.nowhere()))
+                previous = v
+    faults
 
 // ── Fixed-width values ──────────────────────────────────────────────
 
@@ -235,21 +294,45 @@ pub fn check_offsets(body: Bytes, offsets: ArrowBuffer, values_len: Int, length:
 // is in bits rather than bytes so that `ArrowBool` has an answer here
 // instead of a special case at every call site.
 pub fn element_span(values: ArrowBuffer, i: Int, bits: Int) -> Result<ArrowBuffer, ArrowFault>
-    todo("arrow-nv.arrowbuf.element_span")
+    let size = if bits < 8
+        1
+    else
+        bits / 8
+    let at = if bits < 8
+        i * bits / 8
+    else
+        i * size
+    if i < 0 or at + size > values.len
+        let count = if bits < 8
+            values.len * 8 / bits
+        else
+            values.len / size
+        return Err(ArrowIndexOutOfRange(i, count, arrowfault.nowhere()))
+    Ok(ArrowBuffer { start: values.start + at, len: size })
 
 // A signed little-endian integer of `width` bytes at element `i`.
 pub fn int_at(body: Bytes, values: ArrowBuffer, i: Int, width: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowbuf.int_at")
+    let v = uint_at(body, values, i, width)!
+    if width >= 8
+        return Ok(v)
+    let top = 1 << (8 * width - 1)
+    Ok((if v >= top then v - 2 * top else v))
 
 // An unsigned little-endian integer of `width` bytes at element `i`.
 //
 // Separate from `int_at` because novo-lang's `Int` is 64-bit signed and
 // a `UInt64` whose top bit is set has no faithful `Int`: this answers
 // the two's-complement bit pattern and `ArrowDecimalOutOfRange` is
-// NOT raised, which is stated here so a caller reading identifiers
+// not raised, which is stated here so a caller reading identifiers
 // knows to compare them as bit patterns.
 pub fn uint_at(body: Bytes, values: ArrowBuffer, i: Int, width: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowbuf.uint_at")
+    let span = element_span(values, i, width * 8)!
+    if span.start + width > bytes.len(body)
+        return Err(ArrowShortBody(span.start + width, bytes.len(body), arrowfault.at_byte(-1, span.start)))
+    var v = 0
+    for k in 0..width
+        v = v | (byte(body, span.start + k) << (8 * k))
+    Ok(v)
 
 // An IEEE 754 float of `width` bytes (2, 4 or 8) at element `i`,
 // widened to novo-lang's `Float`.
@@ -257,4 +340,37 @@ pub fn uint_at(body: Bytes, values: ArrowBuffer, i: Int, width: Int) -> Result<I
 // `Float16` widening is exact; `Float32` widening is exact; neither
 // direction back is, and `arrowwrite` says what it rounds.
 pub fn float_at(body: Bytes, values: ArrowBuffer, i: Int, width: Int) -> Result<Float, ArrowFault>
-    todo("arrow-nv.arrowbuf.float_at")
+    let raw = uint_at(body, values, i, width)!
+    if width == 2
+        return Ok(float.from_bits(widen(raw, 5, 10)))
+    if width == 4
+        return Ok(float.from_bits(widen(raw, 8, 23)))
+    Ok(float.from_bits(raw))
+
+// The byte at `i`, or 0 outside the body.
+fn byte(body: Bytes, i: Int) -> Int
+    bytes.byte_at(body, i) ?? 0
+
+// The bits of an IEEE 754 binary16 or binary32 value, with `e` exponent
+// bits and `m` fraction bits, as the bits of the same binary64 value.
+// Every such value has an exact binary64 form.
+fn widen(raw: Int, e: Int, m: Int) -> Int
+    let sign = (raw >> (e + m)) & 1
+    let exp = (raw >> m) & ((1 << e) - 1)
+    var frac = raw & ((1 << m) - 1)
+    let bias = (1 << (e - 1)) - 1
+    let top = sign << 63
+    if exp == (1 << e) - 1
+        return top | (2047 << 52) | (frac << (52 - m))
+    if exp == 0
+        if frac == 0
+            return top
+        // A subnormal: shift the fraction up until its leading one is
+        // the implicit bit, counting the shifts off the exponent.
+        var shift = 0
+        for _ in 0..m
+            if (frac & (1 << m)) == 0
+                frac = frac << 1
+                shift = shift + 1
+        return top | ((1 - bias - shift + 1023) << 52) | ((frac & ((1 << m) - 1)) << (52 - m))
+    top | ((exp - bias + 1023) << 52) | (frac << (52 - m))

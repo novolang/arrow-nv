@@ -1,53 +1,51 @@
 // arrowcol.nv — an array over buffers the caller owns, and a record
 // batch as a tree of them.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// `ArrowArray` is a type, three integers, a list of spans and a list of
+// children:
 //
-// **THE LOAD-BEARING INTERFACE OF THIS PACKAGE IS `ArrowArray`.**  It
-// is four integers, a list of spans and a list of children, and the
-// fourth integer is the one the design rests on:
+// - `length`: how many elements this array has.
+// - `null_count`: how many of them are null, or -1 for not known.
+// - `offset`: where this array starts inside buffers it shares.
+// - `buffers`: spans into a body the caller holds.
+// - `children`: the same structure, for a nested type.
 //
-//     data_type   what the buffers mean
-//     length      how many elements THIS array has
-//     null_count  how many of them are null, or -1 for "not known"
-//     offset      where this array starts inside buffers it SHARES
-//     buffers     spans into a body the caller holds
-//     children    the same structure, recursively
+// `offset` is what makes a slice free.  A validity bitmap is addressed
+// from the start of the buffer, so element `i` of an array with offset
+// 1000 is bit `1000 + i`.  Every accessor here takes the array, applies
+// the offset, and checks `i` against `length`.  A slice changes only
+// this array's offset and length.  Children are left as they are: a
+// list's offsets index its child directly, and `struct_field` applies a
+// struct's offset to the child it answers.
 //
-// `offset` is what makes a slice free, and it is what every reader gets
-// wrong once.  A validity bitmap is bit-addressed from the start of the
-// ARRAY, so element `i` of an array with `offset = 1000` is bit `1000 +
-// i` of a bitmap it shares with its parent.  A reader that indexes the
-// bitmap at `i` reads its parent's nulls — plausible values, no error,
-// wrong answers — and this package makes that unwritable by taking the
-// array rather than the buffer in every accessor.  `arrowbuf.bit_at` is
-// the raw spelling and its own comment says not to use it.
+// A record batch is a tree of arrays and a flat list of buffers.  The
+// IPC metadata carries `nodes` and `buffers` as two flat lists, and they
+// are matched to the schema by a pre-order walk: a field, then its
+// children left to right, each node contributing its buffers in
+// `arrowbuf.layout_of` order (the columnar specification, "Recordbatch
+// message").  `flatten_nodes` and `flatten_buffers` are that walk.
 //
-// A RECORD BATCH IS A TREE OF ARRAYS AND A FLAT LIST OF BUFFERS, AND
-// THE ORDER BETWEEN THEM IS A CONVENTION THE FORMAT NEVER WRITES DOWN.
-// The IPC metadata carries `nodes` and `buffers` as two flat lists;
-// re-associating them with the schema is a PRE-ORDER walk — a field,
-// then its children left to right, depth first — and the buffers of
-// each node come in `arrowbuf.layout_of` order.  Every implementation
-// that walked breadth-first, or that emitted a struct's own (empty)
-// values buffer, produces a file that reads as garbage from the first
-// nested column on.  `flatten_nodes` and `flatten_buffers` are that
-// walk, published, so a caller comparing two producers uses the same
-// one this package does.
+// A null count of -1 means not known.  Slicing cannot know the count
+// without scanning the bitmap, so a slice answers -1 and
+// `recount_nulls` is the call that scans.
 //
-// A NULL COUNT OF `-1` MEANS "NOT KNOWN", AND THAT IS DELIBERATE.
-// Slicing cannot recompute a null count without scanning the bitmap,
-// and scanning it would make an O(1) operation O(n) — so a slice
-// answers `-1` and `recount_nulls` is the call that costs what it
-// costs.  An implementation that carried its parent's count through a
-// slice would hand a caller a number larger than the array's length.
+// A dictionary delta is kept beside the dictionary it extends, as a
+// second entry under the same id.  An index past the first entry's
+// length continues into the next, so resolving it needs neither a copy
+// nor a body of its own.
 
+use std.bytes
+use std.list
 use civil
+use arrowfault
+use arrowtype
+use arrowbuf
+use arrowtime
 
 // One column, or one child of one.
 pub struct ArrowArray
     // What the buffers mean.  For a dictionary-encoded column this is
-    // the INDEX type, not the field's value type — the field carries
+    // the index type, not the field's value type — the field carries
     // that, and `ArrowBatch.dictionaries` carries the values.
     data_type: ArrowType
     // How many elements, after `offset`.
@@ -69,7 +67,7 @@ pub struct ArrowArray
 // to.
 pub struct ArrowDictEntry
     id: Int
-    // The dictionary's VALUES, as an array of the field's value type.
+    // The dictionary's values, as an array of the field's value type.
     values: ArrowArray
     // The body those values' buffers span.  A dictionary arrives in its
     // own message with its own body, so it cannot share the batch's.
@@ -102,81 +100,117 @@ pub struct ArrowBatch
 // ```
 pub fn array(data_type: ArrowType, length: Int, null_count: Int,
              buffers: [ArrowBuffer]) -> ArrowArray
-    todo("arrow-nv.arrowcol.array")
+    ArrowArray { data_type: data_type, length: length, null_count: null_count, offset: 0,
+                 buffers: list.clone(buffers), children: [], dictionary_id: -1 }
 
 // An array with children — a list, a struct, a map or a union.
 pub fn nested_array(data_type: ArrowType, length: Int, null_count: Int, buffers: [ArrowBuffer],
                     children: [ArrowArray]) -> ArrowArray
-    todo("arrow-nv.arrowcol.nested_array")
+    ArrowArray { data_type: data_type, length: length, null_count: null_count, offset: 0,
+                 buffers: list.clone(buffers), children: list.clone(children), dictionary_id: -1 }
 
 // An array of dictionary indices, bound to a dictionary id.
 pub fn dict_array(index_type: ArrowType, length: Int, null_count: Int, buffers: [ArrowBuffer],
                   id: Int) -> ArrowArray
-    todo("arrow-nv.arrowcol.dict_array")
+    ArrowArray { data_type: index_type, length: length, null_count: null_count, offset: 0,
+                 buffers: list.clone(buffers), children: [], dictionary_id: id }
 
 // A batch.
 pub fn batch(schema: ArrowSchema, columns: [ArrowArray], rows: Int) -> ArrowBatch
-    todo("arrow-nv.arrowcol.batch")
+    ArrowBatch { schema: schema, columns: list.clone(columns), rows: rows, dictionaries: [] }
 
 // A batch with the dictionaries a stream has installed.
 pub fn batch_with_dicts(schema: ArrowSchema, columns: [ArrowArray], rows: Int,
                         dictionaries: [ArrowDictEntry]) -> ArrowBatch
-    todo("arrow-nv.arrowcol.batch_with_dicts")
+    ArrowBatch { schema: schema,
+        columns: list.clone(columns),
+        rows: rows,
+        dictionaries: list.clone(dictionaries) }
 
 // ── Slicing, which is the point ─────────────────────────────────────
 
 // `count` elements from `from`, sharing every buffer.
 //
-// O(1) and allocation-free: the buffers are the same spans, the
-// children are sliced the same way, and only `offset`, `length` and
-// `null_count` change.  A projection over a two-gigabyte batch costs a
-// handful of structs, which is the reason a columnar format is worth
-// the metadata.
+// Constant time and allocation-free: the buffers are the same spans,
+// the children are left as they are, and only `offset`, `length` and
+// `null_count` change.  `ArrowIndexOutOfRange` for a range past the
+// end, which is refused rather than clamped.
 //
-// The result's `null_count` is `-1`.  See this module's header.
+// The result's `null_count` is `-1`, unless the slice is the whole
+// array.  See this module's header.
+
 pub fn slice(a: ArrowArray, from: Int, count: Int) -> Result<ArrowArray, ArrowFault>
-    todo("arrow-nv.arrowcol.slice")
+    if from < 0 or count < 0 or from + count > a.length
+        return Err(ArrowIndexOutOfRange(from + count, a.length, arrowfault.nowhere()))
+    Ok(moved(a, from, count))
 
 // Every column of a batch sliced the same way.
 pub fn slice_batch(b: ArrowBatch, from: Int, count: Int) -> Result<ArrowBatch, ArrowFault>
-    todo("arrow-nv.arrowcol.slice_batch")
+    if from < 0 or count < 0 or from + count > b.rows
+        return Err(ArrowIndexOutOfRange(from + count, b.rows, arrowfault.nowhere()))
+    var columns: [ArrowArray] = []
+    for c in b.columns
+        list.push(columns, slice(c, from, count)!)
+    Ok(ArrowBatch { schema: b.schema, columns: columns, rows: count, dictionaries: b.dictionaries })
 
 // The null count, scanning the bitmap when it is not known.
 //
 // Costs one pass over `length` bits.  Called by a caller that needs the
 // number, never by an accessor.
 pub fn recount_nulls(body: Bytes, a: ArrowArray) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowcol.recount_nulls")
+    match a.data_type
+        ArrowNull     => Ok(a.length)
+        ArrowUnion(_) => Ok(0)
+        _             =>
+            let v = a.buffers[0]
+            if v.len == 0
+                return Ok(0)
+            if (a.offset + a.length + 7) / 8 > v.len
+                return Err(ArrowShortBody((a.offset + a.length + 7) / 8, v.len, arrowfault.at_byte(-1, v.start)))
+            Ok(a.length - arrowbuf.count_set(body, v, a.offset, a.length))
 
 // A batch's columns by name, or a fault naming the column.
 pub fn column(b: ArrowBatch, name: Str) -> Result<ArrowArray, ArrowFault>
-    todo("arrow-nv.arrowcol.column")
+    let i = arrowtype.field_index(b.schema, name)
+    if i < 0 or i >= list.len(b.columns)
+        return Err(ArrowIndexOutOfRange(i, list.len(b.columns), arrowfault.at_field(name)))
+    Ok(b.columns[i])
 
 // The columns a projection names, in the projection's order.
 //
-// The order is the CALLER's, not the schema's, because a projection
+// The order is the caller's, not the schema's, because a projection
 // that reordered to match the file would make `select a, b` and
 // `select b, a` the same call.
 pub fn project(b: ArrowBatch, names: [Str]) -> Result<ArrowBatch, ArrowFault>
-    todo("arrow-nv.arrowcol.project")
+    var fields: [ArrowField] = []
+    var columns: [ArrowArray] = []
+    for name in names
+        list.push(columns, column(b, name)!)
+        list.push(fields, b.schema.fields[arrowtype.field_index(b.schema, name)])
+    let s = ArrowSchema { fields: fields, metadata: b.schema.metadata, endianness: b.schema.endianness }
+    Ok(ArrowBatch { schema: s, columns: columns, rows: b.rows, dictionaries: b.dictionaries })
 
 // ── Reading one element ─────────────────────────────────────────────
 
 // Whether element `i` is present.
 //
-// THE ACCESSOR THE OFFSET ARGUMENT IS ABOUT.  Reads bit `a.offset + i`
-// of `a.buffers[0]`, and answers `true` when that buffer has length
-// zero — an absent validity bitmap means every element is present, and
-// a reader that treated it as "every element is null" would read an
-// entire non-nullable column as empty.
+// Reads bit `a.offset + i` of `a.buffers[0]`, and answers `true` when
+// that buffer has length zero: an absent validity bitmap means every
+// element is present.  Every element of a `Null` array is absent.  A
+// union has no bitmap of its own, so this answers `true` for it; the
+// child `union_at` names holds the element's own validity.
 pub fn is_valid(body: Bytes, a: ArrowArray, i: Int) -> Result<Bool, ArrowFault>
-    todo("arrow-nv.arrowcol.is_valid")
+    check_index(a, i)!
+    match a.data_type
+        ArrowNull     => Ok(false)
+        ArrowUnion(_) => Ok(true)
+        _             => Ok(arrowbuf.bit_at_or(body, a.buffers[0], a.offset + i, true))
 
 // Whether element `i` is null — `is_valid` negated, published because
 // the call site usually wants this spelling and `not` at every call
 // site is where a negation gets lost.
 pub fn is_null(body: Bytes, a: ArrowArray, i: Int) -> Result<Bool, ArrowFault>
-    todo("arrow-nv.arrowcol.is_null")
+    Ok(not is_valid(body, a, i)!)
 
 // Element `i` of an integer, temporal or boolean column, as an `Int`.
 //
@@ -187,34 +221,78 @@ pub fn is_null(body: Bytes, a: ArrowArray, i: Int) -> Result<Bool, ArrowFault>
 // calls rather than one `?Int` so that a caller scanning a column with
 // no nulls does not pay for an optional per element.
 pub fn int_at(body: Bytes, a: ArrowArray, i: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowcol.int_at")
+    check_index(a, i)!
+    let at = a.offset + i
+    match a.data_type
+        ArrowBool            => Ok((if arrowbuf.bit_at(body, a.buffers[1], at) then 1 else 0))
+        ArrowInt8            => arrowbuf.int_at(body, a.buffers[1], at, 1)
+        ArrowInt16           => arrowbuf.int_at(body, a.buffers[1], at, 2)
+        ArrowInt32           => arrowbuf.int_at(body, a.buffers[1], at, 4)
+        ArrowDate32          => arrowbuf.int_at(body, a.buffers[1], at, 4)
+        ArrowTime32(_)       => arrowbuf.int_at(body, a.buffers[1], at, 4)
+        ArrowUInt8           => arrowbuf.uint_at(body, a.buffers[1], at, 1)
+        ArrowUInt16          => arrowbuf.uint_at(body, a.buffers[1], at, 2)
+        ArrowUInt32          => arrowbuf.uint_at(body, a.buffers[1], at, 4)
+        ArrowInt64           => arrowbuf.int_at(body, a.buffers[1], at, 8)
+        ArrowUInt64          => arrowbuf.int_at(body, a.buffers[1], at, 8)
+        ArrowDate64          => arrowbuf.int_at(body, a.buffers[1], at, 8)
+        ArrowTime64(_)       => arrowbuf.int_at(body, a.buffers[1], at, 8)
+        ArrowTimestamp(_, _) => arrowbuf.int_at(body, a.buffers[1], at, 8)
+        ArrowDuration(_)     => arrowbuf.int_at(body, a.buffers[1], at, 8)
+        _                    => Err(wrong("an integer column", a))
 
 // Element `i` of a floating-point column.
 pub fn float_at(body: Bytes, a: ArrowArray, i: Int) -> Result<Float, ArrowFault>
-    todo("arrow-nv.arrowcol.float_at")
+    check_index(a, i)!
+    match a.data_type
+        ArrowFloat16 => arrowbuf.float_at(body, a.buffers[1], a.offset + i, 2)
+        ArrowFloat32 => arrowbuf.float_at(body, a.buffers[1], a.offset + i, 4)
+        ArrowFloat64 => arrowbuf.float_at(body, a.buffers[1], a.offset + i, 8)
+        _            => Err(wrong("a floating-point column", a))
 
 // Element `i` of a boolean column.
 pub fn bool_at(body: Bytes, a: ArrowArray, i: Int) -> Result<Bool, ArrowFault>
-    todo("arrow-nv.arrowcol.bool_at")
+    check_index(a, i)!
+    if a.data_type != ArrowBool
+        return Err(wrong("a bool column", a))
+    Ok(arrowbuf.bit_at(body, a.buffers[1], a.offset + i))
 
-// The SPAN of element `i` of a `Utf8`, `Binary`, `LargeUtf8`,
+// The span of element `i` of a `Utf8`, `Binary`, `LargeUtf8`,
 // `LargeBinary` or `FixedSizeBinary` column.
 //
-// A span and not a `Str`: the bytes are in the caller's body and
-// copying them is the caller's decision.  A filter that compares a
-// million strings against one literal compares spans; only the rows
-// that survive are ever materialised.
+// The span is into the body, so it can be sliced out of `body` as it
+// stands.  A span and not a `Str`: copying the bytes is the caller's
+// decision.  `ArrowOffsetPastEnd` when the offsets reach past the values
+// buffer.
 pub fn span_at(body: Bytes, a: ArrowArray, i: Int) -> Result<ArrowBuffer, ArrowFault>
-    todo("arrow-nv.arrowcol.span_at")
+    check_index(a, i)!
+    let at = a.offset + i
+    match a.data_type
+        ArrowFixedSizeBinary(w) => arrowbuf.element_span(a.buffers[1], at, w * 8)
+        _                       =>
+            if not (a.data_type == ArrowUtf8 or a.data_type == ArrowBinary or arrowtype.has_large_offsets(a.data_type))
+                or a.data_type == ArrowLargeList
+                return Err(wrong("a string or binary column", a))
+            let values = a.buffers[2]
+            let rel = arrowbuf.value_span(body, a.buffers[1], at, arrowtype.has_large_offsets(a.data_type))!
+            if rel.start < 0 or rel.start + rel.len > values.len
+                return Err(ArrowOffsetPastEnd(at + 1, rel.start + rel.len, values.len, arrowfault.nowhere()))
+            Ok(ArrowBuffer { start: values.start + rel.start, len: rel.len })
 
 // Element `i` of a string column, copied out as a `Str`.
 //
 // The convenience over `span_at`, and the one that costs.  UTF-8 is
-// checked HERE and not on read, which is why `ArrowNotUtf8` names an
+// checked here and not on read, which is why `ArrowNotUtf8` names an
 // index: validating a whole column nobody reads is the cost the format
 // exists to avoid.
 pub fn str_at(body: Bytes, a: ArrowArray, i: Int) -> Result<Str, ArrowFault>
-    todo("arrow-nv.arrowcol.str_at")
+    let span = span_at(body, a, i)!
+    if not arrowbuf.fits(body, span)
+        return Err(ArrowShortBody(arrowbuf.end_of(span), bytes.len(body), arrowfault.at_byte(-1, span.start)))
+    let raw = bytes.slice(body, span.start, span.start + span.len)
+    if not utf8(raw)
+        return Err(ArrowNotUtf8(i, arrowfault.at_byte(-1, span.start)))
+    Ok(bytes.to_str(raw))
 
 // The raw 16 or 32 bytes of a decimal element, little-endian two's
 // complement.
@@ -224,7 +302,11 @@ pub fn str_at(body: Bytes, a: ArrowArray, i: Int) -> Result<Str, ArrowFault>
 // exists to prevent.  A caller that has bigint-nv scales these; one
 // that does not compares them as bytes.
 pub fn decimal_bytes_at(body: Bytes, a: ArrowArray, i: Int) -> Result<ArrowBuffer, ArrowFault>
-    todo("arrow-nv.arrowcol.decimal_bytes_at")
+    check_index(a, i)!
+    match a.data_type
+        ArrowDecimal128(_, _) => arrowbuf.element_span(a.buffers[1], a.offset + i, 128)
+        ArrowDecimal256(_, _) => arrowbuf.element_span(a.buffers[1], a.offset + i, 256)
+        _                     => Err(wrong("a decimal column", a))
 
 // ── Reading a nested element ────────────────────────────────────────
 
@@ -232,15 +314,27 @@ pub fn decimal_bytes_at(body: Bytes, a: ArrowArray, i: Int) -> Result<ArrowBuffe
 //
 // Works for `List`, `LargeList`, `FixedSizeList` and `Map`: the first
 // two read the offsets buffer, `FixedSizeList` multiplies by the width
-// in its type, and a `Map` is a `List` of its entries struct.  One
-// function because a caller walking a nested schema should not branch
-// on which of the four it has.
+// in its type, and a `Map` is a `List` of its entries struct.  The two
+// numbers are positions in the child, from the first to one past the
+// last.
 pub fn child_range(body: Bytes, a: ArrowArray, i: Int) -> Result<(Int, Int), ArrowFault>
-    todo("arrow-nv.arrowcol.child_range")
+    check_index(a, i)!
+    let at = a.offset + i
+    match a.data_type
+        ArrowFixedSizeList(w) => Ok((at * w, at * w + w))
+        ArrowLargeList        =>
+            let span = arrowbuf.value_span(body, a.buffers[1], at, true)!
+            Ok((span.start, span.start + span.len))
+        _                     =>
+            if a.data_type != ArrowList and not is_map(a.data_type)
+                return Err(wrong("a list or map column", a))
+            let span = arrowbuf.value_span(body, a.buffers[1], at, false)!
+            Ok((span.start, span.start + span.len))
 
 // Element `i` of a list, as a slice of its child array.
 pub fn list_at(body: Bytes, a: ArrowArray, i: Int) -> Result<ArrowArray, ArrowFault>
-    todo("arrow-nv.arrowcol.list_at")
+    let (from, to) = child_range(body, a, i)!
+    child_slice(a, 0, from, to - from)
 
 // A struct's field by index.
 //
@@ -248,30 +342,59 @@ pub fn list_at(body: Bytes, a: ArrowArray, i: Int) -> Result<ArrowArray, ArrowFa
 // offset — which is why this is a lookup and not a read, and why a
 // struct column has no values buffer at all.
 pub fn struct_field(a: ArrowArray, index: Int) -> Result<ArrowArray, ArrowFault>
-    todo("arrow-nv.arrowcol.struct_field")
+    if a.data_type != ArrowStruct
+        return Err(wrong("a struct column", a))
+    if index < 0 or index >= list.len(a.children)
+        return Err(ArrowIndexOutOfRange(index, list.len(a.children), arrowfault.nowhere()))
+    child_slice(a, index, a.offset, a.length)
 
 // A map element's key and value arrays, sliced to that element's
 // entries.
 pub fn map_at(body: Bytes, a: ArrowArray, i: Int) -> Result<(ArrowArray, ArrowArray), ArrowFault>
-    todo("arrow-nv.arrowcol.map_at")
+    if not is_map(a.data_type)
+        return Err(wrong("a map column", a))
+    let (from, to) = child_range(body, a, i)!
+    let entries = child_slice(a, 0, from, to - from)!
+    Ok((struct_field(entries, 0)!, struct_field(entries, 1)!))
 
 // Which child holds element `i` of a union, and where in that child.
 //
-// The two answers are one call because a sparse union's offset IS the
+// The two answers are one call because a sparse union's offset is the
 // element index and a dense union's is a second buffer read: a caller
 // that asked for them separately would have to know the mode, and the
 // mode is what this function is for.
 pub fn union_at(body: Bytes, a: ArrowArray, f: ArrowField, i: Int) -> Result<(Int, Int), ArrowFault>
-    todo("arrow-nv.arrowcol.union_at")
+    check_index(a, i)!
+    let at = a.offset + i
+    let dense = match a.data_type
+        ArrowUnion(ArrowDenseUnion)  => true
+        ArrowUnion(ArrowSparseUnion) => false
+        _                            =>
+            return Err(wrong("a union column", a))
+    let type_id = arrowbuf.int_at(body, a.buffers[0], at, 1)!
+    var child = -1
+    for k in 0..list.len(f.type_ids)
+        if f.type_ids[k] == type_id and child < 0
+            child = k
+    if child < 0
+        return Err(ArrowUnionTypeIdUnknown(type_id, arrowfault.at_field(f.name)))
+    let place = if dense
+        arrowbuf.int_at(body, a.buffers[1], at, 4)!
+    else
+        at
+    Ok((child, place))
 
 // ── Dictionaries ────────────────────────────────────────────────────
 
 // The dictionary an array's indices resolve against.
 pub fn dictionary_for(b: ArrowBatch, a: ArrowArray) -> Result<ArrowDictEntry, ArrowFault>
-    todo("arrow-nv.arrowcol.dictionary_for")
+    for d in b.dictionaries
+        if d.id == a.dictionary_id
+            return Ok(d)
+    Err(ArrowDictionaryMissing(a.dictionary_id, arrowfault.nowhere()))
 
 // Element `i` of a dictionary-encoded column, resolved to a span in the
-// DICTIONARY's body.
+// dictionary's body.
 //
 // Two bodies, and the signature says so: the indices are in the batch's
 // body and the values are in the dictionary message's, which arrived
@@ -280,22 +403,33 @@ pub fn dictionary_for(b: ArrowBatch, a: ArrowArray) -> Result<ArrowDictEntry, Ar
 // in the batch.
 pub fn dict_span_at(body: Bytes, b: ArrowBatch, a: ArrowArray,
                     i: Int) -> Result<ArrowBuffer, ArrowFault>
-    todo("arrow-nv.arrowcol.dict_span_at")
+    let (entry, index) = resolve(body, b, a, i)!
+    span_at(entry.body, entry.values, index)
 
 // The same, copied out as a `Str`.
 pub fn dict_str_at(body: Bytes, b: ArrowBatch, a: ArrowArray, i: Int) -> Result<Str, ArrowFault>
-    todo("arrow-nv.arrowcol.dict_str_at")
+    let (entry, index) = resolve(body, b, a, i)!
+    str_at(entry.body, entry.values, index)
 
 // A dictionary batch applied to the set in force — a replacement, or a
 // delta appended to what is there.
 //
-// `is_delta` is the message's own flag and the two behave differently
-// enough that a reader which ignored it would silently drop values: a
-// delta APPENDS and the indices in later batches count past the end of
-// the first dictionary.
+// `is_delta` is the message's own flag.  A replacement removes every
+// entry under its id.  A delta is kept after the entries already there,
+// and an index past their lengths continues into it, so the indices in
+// later batches count past the end of the first dictionary.
+
 pub fn install_dictionary(dicts: [ArrowDictEntry], entry: ArrowDictEntry,
                           is_delta: Bool) -> [ArrowDictEntry]
-    todo("arrow-nv.arrowcol.install_dictionary")
+    var out: [ArrowDictEntry] = []
+    if is_delta
+        out = list.clone(dicts)
+    else
+        for d in dicts
+            if d.id != entry.id
+                list.push(out, d)
+    list.push(out, entry)
+    out
 
 // ── The pre-order walk ──────────────────────────────────────────────
 
@@ -305,17 +439,34 @@ pub fn install_dictionary(dicts: [ArrowDictEntry], entry: ArrowDictEntry,
 // Pre-order, depth first, children left to right.  See this module's
 // header for why this is published rather than internal.
 pub fn flatten_nodes(b: ArrowBatch) -> [ArrowArray]
-    todo("arrow-nv.arrowcol.flatten_nodes")
+    var out: [ArrowArray] = []
+    for c in b.columns
+        nodes_of(c, out)
+    out
 
 // Every buffer in a batch, in the order the IPC metadata's `buffers`
 // list has them — the same walk, each node contributing
 // `arrowbuf.layout_of` in order.
 pub fn flatten_buffers(b: ArrowBatch) -> [ArrowBuffer]
-    todo("arrow-nv.arrowcol.flatten_buffers")
+    var out: [ArrowBuffer] = []
+    for n in flatten_nodes(b)
+        list.append(out, n.buffers)
+    out
 
 // The dotted path of every node of the walk, for a fault report.
 pub fn node_paths(b: ArrowBatch) -> [Str]
-    todo("arrow-nv.arrowcol.node_paths")
+    var out: [Str] = []
+    for i in 0..list.len(b.columns)
+        let name = if i < list.len(b.schema.fields)
+            b.schema.fields[i].name
+        else
+            "${i}"
+        let children = if i < list.len(b.schema.fields)
+            b.schema.fields[i].children
+        else
+            []
+        paths_of(b.columns[i], name, children, out)
+    out
 
 // ── Checking ────────────────────────────────────────────────────────
 
@@ -328,18 +479,65 @@ pub fn node_paths(b: ArrowBatch) -> [Str]
 // path from the root so a caller can see that four of them are the same
 // column.
 pub fn validate(body: Bytes, a: ArrowArray, path: Str) -> [ArrowFault]
-    todo("arrow-nv.arrowcol.validate")
+    var faults: [ArrowFault] = []
+    let w = arrowfault.at_field(path)
+    let want = list.len(arrowbuf.layout_of(a.data_type))
+    if list.len(a.buffers) != want
+        return [ArrowLayoutMismatch(want, list.len(a.buffers), w)]
+    if a.length < 0 or a.offset < 0 or a.null_count < -1
+        return [ArrowNegativeLength((if a.length < 0 then a.length else (if a.offset < 0 then a.offset else a.null_count)), w)]
+    if a.null_count > a.length
+        list.push(faults, ArrowIndexOutOfRange(a.null_count, a.length, w))
+    for k in 0..want
+        let buf = a.buffers[k]
+        if not arrowbuf.fits(body, buf)
+            list.push(faults,
+                ArrowShortBody(arrowbuf.end_of(buf), bytes.len(body), arrowfault.at_buffer(-1, path, k, buf.start)))
+    if list.len(faults) > 0
+        return faults
+    list.append(faults, sizes_fault(body, a, path))
+    let children = arrowtype.child_count_of(a.data_type)
+    if children >= 0 and list.len(a.children) != children
+        list.push(faults, ArrowChildCountWrong(children, list.len(a.children), w))
+    for k in 0..list.len(a.children)
+        let c = a.children[k]
+        if (a.data_type == ArrowStruct or a.data_type == ArrowUnion(ArrowSparseUnion))
+            and c.length < a.offset + a.length
+            list.push(faults,
+                ArrowLengthMismatch(a.offset + a.length, c.length, arrowfault.at_field("${path}.${k}")))
+        list.append(faults, validate(body, c, "${path}.${k}"))
+    faults
 
 // Every way a batch contradicts its schema — a column count that is not
 // the schema's, a column whose type is not its field's, a column whose
 // length is not `rows`, a dictionary-encoded field with no dictionary
 // installed — plus every array's own faults.
 pub fn validate_batch(body: Bytes, b: ArrowBatch) -> [ArrowFault]
-    todo("arrow-nv.arrowcol.validate_batch")
+    var faults: [ArrowFault] = []
+    let n = list.len(b.schema.fields)
+    if list.len(b.columns) != n
+        return [ArrowNodeCountWrong(n, list.len(b.columns), arrowfault.nowhere())]
+    for i in 0..n
+        let f = b.schema.fields[i]
+        let c = b.columns[i]
+        let want = match f.dictionary
+            Some(d) => d.index_type
+            None    => f.data_type
+        if not arrowtype.type_eq(want, c.data_type)
+            list.push(faults, ArrowWrongType(arrowtype.type_name(want),
+                arrowtype.type_name(c.data_type),
+                arrowfault.at_field(f.name)))
+        if c.length != b.rows
+            list.push(faults, ArrowLengthMismatch(b.rows, c.length, arrowfault.at_field(f.name)))
+        if let Some(d) = f.dictionary
+            if not has_dictionary(b, d.id)
+                list.push(faults, ArrowDictionaryMissing(d.id, arrowfault.at_field(f.name)))
+        list.append(faults, validate(body, c, f.name))
+    faults
 
 // Whether a batch passes every check.
 pub fn batch_ok(body: Bytes, b: ArrowBatch) -> Bool
-    todo("arrow-nv.arrowcol.batch_ok")
+    list.len(validate_batch(body, b)) == 0
 
 // How many bytes of the body a batch actually reaches.
 //
@@ -347,7 +545,11 @@ pub fn batch_ok(body: Bytes, b: ArrowBatch) -> Bool
 // body to the part a batch needs asks for, and what a writer's test
 // compares against the length it declared.
 pub fn body_reach(b: ArrowBatch) -> Int
-    todo("arrow-nv.arrowcol.body_reach")
+    var reach = 0
+    for buf in flatten_buffers(b)
+        if arrowbuf.end_of(buf) > reach
+            reach = arrowbuf.end_of(buf)
+    reach
 
 // The civil date element `i` of a `Date32` or `Date64` column names.
 //
@@ -355,4 +557,167 @@ pub fn body_reach(b: ArrowBatch) -> Int
 // conversion are one call a caller wants, and the split would make
 // every date read two.  `arrowtime` owns the conversion itself.
 pub fn date_at(body: Bytes, a: ArrowArray, i: Int) -> Result<civil.CivilDate, ArrowFault>
-    todo("arrow-nv.arrowcol.date_at")
+    let n = int_at(body, a, i)!
+    match a.data_type
+        ArrowDate32 => arrowtime.date32_to_civil(n)
+        ArrowDate64 => arrowtime.date64_to_civil(n)
+        _           => Err(wrong("a date column", a))
+
+// The same array from `from`, `count` long, sharing every buffer.
+fn moved(a: ArrowArray, from: Int, count: Int) -> ArrowArray
+    let whole = from == 0 and count == a.length
+    ArrowArray { data_type: a.data_type, length: count, null_count: (if whole then a.null_count else -1),
+                 offset: a.offset + from, buffers: a.buffers, children: a.children, dictionary_id: a.dictionary_id }
+
+// Child `k` of an array, sliced to `count` elements from `from`.
+fn child_slice(a: ArrowArray, k: Int, from: Int, count: Int) -> Result<ArrowArray, ArrowFault>
+    if k >= list.len(a.children)
+        return Err(ArrowChildCountWrong(k + 1, list.len(a.children), arrowfault.nowhere()))
+    slice(a.children[k], from, count)
+
+fn check_index(a: ArrowArray, i: Int) -> Result<Unit, ArrowFault>
+    if i < 0 or i >= a.length
+        return Err(ArrowIndexOutOfRange(i, a.length, arrowfault.nowhere()))
+    Ok()
+
+fn wrong(want: Str, a: ArrowArray) -> ArrowFault
+    ArrowWrongType(want, arrowtype.type_name(a.data_type), arrowfault.nowhere())
+
+fn is_map(t: ArrowType) -> Bool
+    match t
+        ArrowMap(_) => true
+        _           => false
+
+// Whether bytes are UTF-8 (RFC 3629).
+fn utf8(raw: Bytes) -> Bool
+    let n = bytes.len(raw)
+    var i = 0
+    loop
+        if i >= n
+            return true
+        let b = bytes.byte_at(raw, i) ?? 0
+        let width = utf8_width(b)
+        if width == 0 or i + width > n
+            return false
+        let b1 = bytes.byte_at(raw, i + 1) ?? 0
+        let lo = if b == 224
+            160
+        else
+            if b == 240
+                144
+            else
+                128
+        let hi = if b == 237
+            159
+        else
+            if b == 244
+                143
+            else
+                191
+        if width > 1 and (b1 < lo or b1 > hi)
+            return false
+        for k in i + 2..i + width
+            let c = bytes.byte_at(raw, k) ?? 0
+            if c < 128 or c > 191
+                return false
+        i = i + width
+
+// How many bytes a UTF-8 sequence starting with `b` occupies, and 0
+// for a byte no sequence starts with.
+fn utf8_width(b: Int) -> Int
+    if b < 128
+        return 1
+    if b >= 194 and b <= 223
+        return 2
+    if b >= 224 and b <= 239
+        return 3
+    if b >= 240 and b <= 244
+        return 4
+    0
+
+// The dictionary entry index `i` of `a` resolves to, and the index
+// within it.  Deltas are entries after the first under the same id.
+fn resolve(body: Bytes, b: ArrowBatch, a: ArrowArray,
+           i: Int) -> Result<(ArrowDictEntry, Int), ArrowFault>
+    var index = int_at(body, a, i)!
+    var size = 0
+    for d in b.dictionaries
+        if d.id == a.dictionary_id
+            if index >= 0 and index < d.values.length
+                return Ok((d, index))
+            size = size + d.values.length
+            index = index - d.values.length
+    if size == 0
+        return Err(ArrowDictionaryMissing(a.dictionary_id, arrowfault.nowhere()))
+    Err(ArrowDictionaryIndexOutOfRange(index + size, size, arrowfault.nowhere()))
+
+fn has_dictionary(b: ArrowBatch, id: Int) -> Bool
+    for d in b.dictionaries
+        if d.id == id
+            return true
+    false
+
+fn nodes_of(a: ArrowArray, var out: [ArrowArray])
+    list.push(out, a)
+    for c in a.children
+        nodes_of(c, out)
+
+fn paths_of(a: ArrowArray, here: Str, fields: [ArrowField], var out: [Str])
+    list.push(out, here)
+    for k in 0..list.len(a.children)
+        let name = if k < list.len(fields)
+            fields[k].name
+        else
+            "${k}"
+        let grand = if k < list.len(fields)
+            fields[k].children
+        else
+            []
+        paths_of(a.children[k], "${here}.${name}", grand, out)
+
+// The faults of buffers too short for the elements an array reaches.
+fn sizes_fault(body: Bytes, a: ArrowArray, path: Str) -> [ArrowFault]
+    let end = a.offset + a.length
+    var faults: [ArrowFault] = []
+    let roles = arrowbuf.layout_of(a.data_type)
+    for k in 0..list.len(roles)
+        let buf = a.buffers[k]
+        let need = match roles[k]
+            ArrowValidityRole    => if buf.len == 0
+                0
+            else
+                (end + 7) / 8
+            ArrowBitsRole        => (end + 7) / 8
+            ArrowOffset32Role    => if a.length == 0
+                0
+            else
+                (end + 1) * 4
+            ArrowOffset64Role    => if a.length == 0
+                0
+            else
+                (end + 1) * 8
+            ArrowValuesRole      =>
+                let width = arrowtype.fixed_width_bits(a.data_type)
+                if width > 0
+                    (end * width + 7) / 8
+                else
+                    0
+            ArrowTypeIdRole      => end
+            ArrowUnionOffsetRole => end * 4
+        if buf.len < need
+            list.push(faults, ArrowShortBody(need, buf.len, arrowfault.at_buffer(-1, path, k, buf.start)))
+    if list.len(faults) == 0 and arrowtype.has_offsets(a.data_type) and a.length > 0
+        let large = arrowtype.has_large_offsets(a.data_type)
+        let values_len = if list.len(roles) == 3
+            a.buffers[2].len
+        else
+            child_length(a)
+        for f in arrowbuf.check_offsets(body, a.buffers[1], values_len, a.length, a.offset, large)
+            list.push(faults, arrowfault.under(f, path))
+    faults
+
+fn child_length(a: ArrowArray) -> Int
+    if list.len(a.children) == 0
+        0
+    else
+        a.children[0].length

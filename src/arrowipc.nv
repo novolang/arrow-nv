@@ -1,46 +1,43 @@
 // arrowipc.nv — the IPC stream and file formats, read: the framing, the
-// message envelope, and a feed-and-drain reader that never holds a
-// batch it has not been asked for.
+// message envelope, and a feed-and-drain reader.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// The stream format is a sequence of encapsulated messages ending with a
+// zero-length one.  The file format is the same sequence between
+// `ARROW1\0\0` at the start and a footer, its length and `ARROW1` at the
+// end; the footer indexes every message by byte offset (the columnar
+// specification, "IPC File Format").  So one reader handles both, and
+// `ArrowIpcMode` is an argument rather than a second type.
 //
-// TWO FORMATS, ONE BODY OF WORK.  The STREAM format is a sequence of
-// encapsulated messages ending with a zero-length one; the FILE format
-// is the same sequence with `ARROW1\0\0` at both ends and a footer
-// before the trailing magic that indexes every message by byte offset.
-// So a stream reader reads a file's middle, and a file reader is a
-// stream reader plus a footer — which is why `ArrowIpcReader` handles
-// both and `ArrowIpcMode` is a constructor argument rather than two
-// types.
+// An encapsulated message is four parts (the specification,
+// "Encapsulated message format"):
 //
-// AN ENCAPSULATED MESSAGE IS FOUR PARTS AND THE FIRST ONE IS A TRAP:
+// - `0xFFFFFFFF`, the continuation marker;
+// - a little-endian `int32`, the metadata length, padding included;
+// - the metadata, a FlatBuffers `Message`;
+// - the body, holding the buffers at the offsets the metadata gives.
 //
-//     0xFFFFFFFF          the continuation marker, little-endian
-//     int32               the metadata length, padded to 8
-//     <metadata>          a FlatBuffers `Message`
-//     <body>              the buffers, contiguous, at the offsets the
-//                         metadata's `buffers` list gives
+// Writers before Arrow 0.15 omit the marker, so a reader that assumed
+// it would read the length as the marker.  `ArrowBadContinuation` names
+// a missing marker, and `with_legacy` accepts the older framing for a
+// caller reading an archive.
 //
-// The continuation marker was added in Arrow 0.15 and older writers
-// omit it, so a reader that assumed it reads the metadata length as the
-// marker and the metadata as the length.  `ArrowBadContinuation` names
-// it, and `with_legacy` accepts the pre-0.15 framing for a caller
-// reading an archive — off by default, because silently accepting both
-// is how a corrupt stream gets read as a legacy one.
+// The reader answers events: schema seen, dictionary seen, batch seen,
+// stream ended.  A batch in an event is spans into the chunk the caller
+// fed, and nothing is copied.  The reader keeps no bytes of its own: a
+// message that straddles the end of a chunk is left unconsumed, and the
+// caller feeds it again with the bytes that follow.
 //
-// **THE READER IS FEED-AND-DRAIN OVER EVENTS, NOT OVER BATCHES.**  A
-// record batch can be larger than memory and a stream is a sequence of
-// them, so `feed` answers EVENTS — schema seen, dictionary seen, batch
-// seen, stream ended — and the batch an event carries is a tree of
-// spans into a body the caller still owns.  Nothing here copies a
-// buffer, and the reader's own state is bounded by the SCHEMA's size
-// rather than by the data's.
-//
-// THE CALLER SIZES THE LIMIT, BEFORE ANYTHING IS ALLOCATED.  A message
-// header can claim a metadata length of two gigabytes.  `with_limit`
-// is the number that crosses the interface first, and a message past it
-// is `ArrowMessageTooLarge` carrying both numbers — the same shape
-// zstd-nv's window limit takes, and for the same reason.
+// The limits are checked against the lengths a message declares before
+// anything is read past its prefix, and a message past one is
+// `ArrowMessageTooLarge` carrying both numbers.
+
+use std.bytes
+use std.list
+use arrowfault
+use arrowtype
+use arrowbuf
+use arrowfb
+use arrowcol
 
 // Which of the two formats a reader is reading.
 pub enum ArrowIpcMode
@@ -54,8 +51,8 @@ pub enum ArrowIpcMode
 
 // What the reader produced from the bytes it was fed.
 //
-// **THE ACTION ENUM OF THIS PACKAGE.**  Every one of these is something
-// the HOST must then decide about, and the reader decides none of it:
+// Every one of these is something
+// the host must then decide about, and the reader decides none of it:
 // it does not open the next file, it does not resolve the schema
 // against a table definition, it does not choose whether a batch is
 // worth materialising.
@@ -71,7 +68,7 @@ pub enum ArrowIpcEvent
     // that ends a file.
     ArrowStreamEnded
     // A message kind this package does not read — the two tensor kinds.
-    // An EVENT rather than a fault, because skipping one is correct:
+    // An event rather than a fault, because skipping one is correct:
     // the metadata gives its body length, so a reader steps over a
     // tensor and keeps reading the record batches after it.
     ArrowMessageSkipped(kind: Str, body_len: Int)
@@ -88,9 +85,8 @@ pub struct ArrowIpcStep
 
 // The reader.
 //
-// Its state is the mode, the limits, the schema once seen, the
-// dictionaries installed, and a small pending region — bounded by the
-// schema, not by the data.
+// Its state is the mode, the limits, the schema once seen and the
+// dictionaries installed.  It holds no bytes: see this module's header.
 pub struct ArrowIpcReader
     mode: ArrowIpcMode
     // The largest metadata block this reader will accept.
@@ -103,6 +99,18 @@ pub struct ArrowIpcReader
     // Messages read so far, which is what a fault's `message`
     // coordinate counts.
     messages: Int
+    // The schema, once its message has been read.
+    schema: ?ArrowSchema
+    // The dictionaries installed so far.
+    dictionaries: [ArrowDictEntry]
+    // Whether a file's leading magic has been read.
+    started: Bool
+    // Whether the stream's end has been read.
+    ended: Bool
+    // How many bytes the last `feed` left unconsumed, and how many the
+    // message they start needs, when that is known.
+    waiting: Int
+    wanting: Int
 
 // A reader with the default limits.
 //
@@ -114,28 +122,30 @@ pub struct ArrowIpcReader
 //     println("${r.messages}")
 // ```
 pub fn reader(mode: ArrowIpcMode) -> ArrowIpcReader
-    todo("arrow-nv.arrowipc.reader")
+    ArrowIpcReader { mode: mode, metadata_limit: default_metadata_limit(), body_limit: default_body_limit(),
+                     legacy: false, messages: 0, schema: None, dictionaries: [], started: false, ended: false,
+                     waiting: 0, wanting: 0 }
 
 // The default metadata limit — enough for a schema with tens of
 // thousands of fields and not enough for a header that lies.
 pub fn default_metadata_limit() -> Int
-    todo("arrow-nv.arrowipc.default_metadata_limit")
+    64 * 1024 * 1024
 
 // The default body limit.
 pub fn default_body_limit() -> Int
-    todo("arrow-nv.arrowipc.default_body_limit")
+    2147483647
 
 // A reader that will not accept a metadata block past `cap` bytes.
 pub fn with_metadata_limit(r: ArrowIpcReader, cap: Int) -> ArrowIpcReader
-    todo("arrow-nv.arrowipc.with_metadata_limit")
+    with_state(r, cap, r.body_limit, r.legacy)
 
 // A reader that will not accept a body past `cap` bytes.
 //
 // The number that crosses the interface before anything is allocated.
-// A message past it is refused carrying BOTH numbers, so a caller can
+// A message past it is refused carrying both numbers, so a caller can
 // raise the limit deliberately rather than by trial.
 pub fn with_body_limit(r: ArrowIpcReader, cap: Int) -> ArrowIpcReader
-    todo("arrow-nv.arrowipc.with_body_limit")
+    with_state(r, r.metadata_limit, cap, r.legacy)
 
 // A reader that accepts the pre-0.15 framing, without the continuation
 // marker.
@@ -144,34 +154,100 @@ pub fn with_body_limit(r: ArrowIpcReader, cap: Int) -> ArrowIpcReader
 // read a corrupt stream as a legacy one, and the corruption would
 // surface as a schema with forty thousand fields.
 pub fn with_legacy(r: ArrowIpcReader) -> ArrowIpcReader
-    todo("arrow-nv.arrowipc.with_legacy")
+    with_state(r, r.metadata_limit, r.body_limit, true)
 
 // Feed a chunk, take whatever finished.
 //
 // `chunk` is the caller's bytes at `chunk_at` in the overall stream,
-// and every span in every event is an offset into THAT chunk — so a
+// and every span in every event is an offset into that chunk — so a
 // caller that keeps the chunk keeps the batch, and one that reuses the
 // chunk must materialise first.  Saying which is the caller's decision
 // and this signature is where it is made.
 pub fn feed(r: ArrowIpcReader, chunk: Bytes, chunk_at: Int) -> Result<ArrowIpcStep, ArrowFault>
-    todo("arrow-nv.arrowipc.feed")
+    var cur = r
+    var events: [ArrowIpcEvent] = []
+    let n = bytes.len(chunk)
+    var pos = 0
+    if cur.ended
+        if n > 0
+            return Err(ArrowUnexpectedMessage("bytes", "nothing after the end of the stream",
+                                              arrowfault.at_byte(cur.messages, chunk_at)))
+        return Ok(ArrowIpcStep { reader: cur, events: [], consumed: 0 })
+    if cur.mode == ArrowFileFormat and not cur.started
+        if n < 8
+            return Ok(ArrowIpcStep { reader: waiting(cur, n, 8), events: [], consumed: 0 })
+        if not magic_at(chunk, 0)
+            return Err(ArrowBadMagic(arrowfault.at_byte(0, chunk_at)))
+        pos = 8
+        cur = started(cur)
+    var want = 0
+    loop
+        if pos >= n
+            break
+        if cur.mode == ArrowFileFormat and word(chunk, pos) != 4294967295
+            if trailer_at(chunk, pos)
+                list.push(events, ArrowStreamEnded)
+                cur = ended(cur)
+                pos = n
+            break
+        let prefix = frame(chunk, pos, cur.legacy)
+        if let Err(f) = prefix
+            if arrowfault.is_incomplete(f)
+                break
+            return Err(arrowfault.in_message(f, cur.messages, chunk_at))
+        let (_, meta_at, meta_len) = prefix!
+        if meta_len == 0
+            pos = meta_at
+            if cur.mode == ArrowStreamFormat
+                list.push(events, ArrowStreamEnded)
+                cur = ended(cur)
+                break
+            continue
+        if meta_len > cur.metadata_limit
+            return Err(ArrowMessageTooLarge(meta_len, cur.metadata_limit, arrowfault.at_byte(cur.messages, chunk_at + pos)))
+        if meta_at + meta_len > n
+            want = meta_at + meta_len - pos
+            break
+        let h = in_message(read_header(chunk, pos, cur.legacy), cur, chunk_at)!
+        if h.body_len > cur.body_limit
+            return Err(ArrowMessageTooLarge(h.body_len, cur.body_limit, arrowfault.at_byte(cur.messages, chunk_at + pos)))
+        if h.body_at + h.body_len > n
+            want = h.body_at + h.body_len - pos
+            break
+        let step = in_message(message(cur, chunk, h), cur, chunk_at)!
+        let (next, event) = step
+        cur = next
+        list.push(events, event)
+        pos = h.body_at + h.body_len
+    Ok(ArrowIpcStep { reader: waiting(cur, n - pos, want), events: events, consumed: pos })
 
 // Tell the reader the stream has ended.
 //
-// Answers `ArrowStreamEnded` for a clean end and `ArrowShortBody` for a
-// stream that stopped inside a message — which is the distinction a
-// caller needs to decide between "done" and "the connection dropped",
-// and one a reader that only answered events could not make.
+// Answers `ArrowStreamEnded` for a stream that stopped between messages
+// without its end marker, and nothing when the end was already read.
+// `ArrowShortBody` for a stream that stopped inside a message, which is
+// what separates "done" from "the connection dropped".  A file whose
+// footer was never read is `ArrowFooterNotFound`.
+
 pub fn finish(r: ArrowIpcReader) -> Result<[ArrowIpcEvent], ArrowFault>
-    todo("arrow-nv.arrowipc.finish")
+    if r.ended
+        return Ok([])
+    if r.waiting > 0
+        return Err(ArrowShortBody((if r.wanting > r.waiting then r.wanting else r.waiting + 1), r.waiting,
+                                  arrowfault.at_byte(r.messages, -1)))
+    if r.mode == ArrowFileFormat
+        return Err(ArrowFooterNotFound(arrowfault.at_byte(r.messages, -1)))
+    Ok([ArrowStreamEnded])
 
 // The schema, once the reader has seen it.
 pub fn schema_of(r: ArrowIpcReader) -> Result<ArrowSchema, ArrowFault>
-    todo("arrow-nv.arrowipc.schema_of")
+    match r.schema
+        Some(s) => Ok(s)
+        None    => Err(ArrowUnexpectedMessage("request for the schema", "schema", arrowfault.at_byte(r.messages, -1)))
 
 // Whether the reader has seen the schema yet.
 pub fn has_schema(r: ArrowIpcReader) -> Bool
-    todo("arrow-nv.arrowipc.has_schema")
+    r.schema != None
 
 // ── One message at a time, for a caller that already has it whole ───
 
@@ -207,39 +283,101 @@ pub enum ArrowMessageKind
 // record every offset, decode nothing — does not pay for the schema
 // decode it will not use.
 pub fn read_header(src: Bytes, at: Int, legacy: Bool) -> Result<ArrowMessageHeader, ArrowFault>
-    todo("arrow-nv.arrowipc.read_header")
+    let (continuation, meta_at, meta_len) = frame(src, at, legacy)!
+    if meta_len == 0
+        return Ok(ArrowMessageHeader { continuation: continuation, metadata_at: meta_at, metadata_len: 0,
+                                       body_at: meta_at, body_len: 0, kind: ArrowEndOfStream, version: 5 })
+    let meta = metadata(src, meta_at, meta_len)!
+    let root = arrowfb.root_table(meta)!
+    let version = arrowfb.field_int(meta, root, 0, 2, 0)! + 1
+    if version < 4 or version > 5
+        return Err(ArrowVersionUnsupported(version, arrowfault.at_byte(-1, meta_at)))
+    let code = arrowfb.field_uint(meta, root, 1, 1, 0)!
+    let kind = match code
+        1 => ArrowSchemaMessage
+        2 => ArrowDictionaryBatchMessage
+        3 => ArrowRecordBatchMessage
+        4 => ArrowTensorMessage
+        5 => ArrowTensorMessage
+        _ =>
+            return Err(ArrowUnexpectedMessage("header type ${code}", "a schema, a dictionary or a record batch",
+                                               arrowfault.at_byte(-1, meta_at)))
+    let body_len = arrowfb.field_int(meta, root, 3, 8, 0)!
+    if body_len < 0
+        return Err(ArrowNegativeLength(body_len, arrowfault.at_byte(-1, meta_at)))
+    Ok(ArrowMessageHeader { continuation: continuation, metadata_at: meta_at, metadata_len: meta_len,
+                            body_at: meta_at + meta_len, body_len: body_len, kind: kind, version: version })
 
 // The schema a schema message carries.
 pub fn read_schema(src: Bytes, h: ArrowMessageHeader) -> Result<ArrowSchema, ArrowFault>
-    todo("arrow-nv.arrowipc.read_schema")
+    let (meta, head) = header_table(src, h, ArrowSchemaMessage)!
+    schema_at(meta, head)
 
-// The batch a record-batch message describes, as spans into `src` from
-// `h.body_at`.
+// The batch a record-batch message describes, as spans into `src`: each
+// buffer's start is `h.body_at` plus its offset in the body.
 //
 // The dictionaries must already be in force: a batch with a
 // dictionary-encoded column and no dictionary installed is
 // `ArrowDictionaryMissing`, not a batch with a hole in it.
 pub fn read_batch(src: Bytes, h: ArrowMessageHeader, s: ArrowSchema,
                   dicts: [ArrowDictEntry]) -> Result<ArrowBatch, ArrowFault>
-    todo("arrow-nv.arrowipc.read_batch")
+    let (meta, head) = header_table(src, h, ArrowRecordBatchMessage)!
+    uncompressed(meta, head)!
+    let rows = arrowfb.field_int(meta, head, 0, 8, 0)!
+    var walk = BatchWalk { nodes: 0, buffers: 0 }
+    var columns: [ArrowArray] = []
+    for f in s.fields
+        list.push(columns, node(src, h, meta, head, f, f.name, walk)!)
+    counts(meta, head, walk, arrowtype.node_count_of(s), arrowtype.buffer_count_of_schema(s))!
+    for f in s.fields
+        if let Some(d) = f.dictionary
+            if not installed(dicts, d.id)
+                return Err(ArrowDictionaryMissing(d.id, arrowfault.at_field(f.name)))
+    Ok(arrowcol.batch_with_dicts(s, columns, rows, dicts))
 
 // The dictionary a dictionary-batch message carries, and whether it is
 // a delta.
 pub fn read_dictionary(src: Bytes, h: ArrowMessageHeader,
                        s: ArrowSchema) -> Result<(ArrowDictEntry, Bool), ArrowFault>
-    todo("arrow-nv.arrowipc.read_dictionary")
+    let (meta, head) = header_table(src, h, ArrowDictionaryBatchMessage)!
+    let id = arrowfb.field_int(meta, head, 0, 8, 0)!
+    let delta = arrowfb.field_bool(meta, head, 2, false)!
+    let (data, present) = arrowfb.field_table(meta, head, 1)!
+    if not present
+        return Err(ArrowShortMetadata(0, 0, arrowfault.at_byte(-1, h.metadata_at)))
+    uncompressed(meta, data)!
+    let Some(f) = dictionary_field(s.fields, id) else return Err(ArrowDictionaryMissing(id, arrowfault.nowhere()))
+    // The values are an array of the field's value type, walked as a
+    // one-field batch.
+    let values_field = ArrowField { name: f.name, data_type: f.data_type, nullable: true, children: f.children,
+                                    dictionary: None, type_ids: f.type_ids, metadata: [] }
+    var walk = BatchWalk { nodes: 0, buffers: 0 }
+    let values = node(src, h, meta, data, values_field, f.name, walk)!
+    let one = arrowtype.schema([values_field])
+    counts(meta, data, walk, arrowtype.node_count_of(one), arrowtype.buffer_count_of_schema(one))!
+    Ok((ArrowDictEntry { id: id, values: values, body: src }, delta))
 
 // The compression a record-batch message declares, if any.
 //
-// Arrow's IPC body compression is LZ4_FRAME or ZSTD applied PER BUFFER,
-// each prefixed with its uncompressed length — and this package does
-// NOT decompress: it answers which codec the message names and refuses
-// to read the buffers, because taking lz4-nv and zstd-nv here would
-// make every consumer of the schema types download two compression
-// codecs.  A `arrow-ipc-zip-nv` over those two is the row that would
-// close it, and it is named here rather than pretended about.
+// Arrow's IPC body compression is LZ4_FRAME or ZSTD applied per buffer,
+// each prefixed with its uncompressed length.  This package does not
+// decompress: this answers which codec the message names, or the empty
+// text for none, and `read_batch` refuses a compressed body with
+// `ArrowTypeUnsupported`.  Decompressing would put lz4-nv and zstd-nv in
+// the dependencies of every consumer of the schema types.
 pub fn compression_of(src: Bytes, h: ArrowMessageHeader) -> Result<Str, ArrowFault>
-    todo("arrow-nv.arrowipc.compression_of")
+    let kind = if h.kind == ArrowDictionaryBatchMessage
+        ArrowDictionaryBatchMessage
+    else
+        ArrowRecordBatchMessage
+    let (meta, head) = header_table(src, h, kind)!
+    var batch = head
+    if kind == ArrowDictionaryBatchMessage
+        batch = arrowfb.field_table(meta, head, 1)!.0
+    let (c, present) = arrowfb.field_table(meta, batch, 3)!
+    if not present
+        return Ok("")
+    Ok((if arrowfb.field_int(meta, c, 0, 1, 0)! == 1 then "ZSTD" else "LZ4_FRAME"))
 
 // ── The file format ─────────────────────────────────────────────────
 
@@ -259,46 +397,99 @@ pub struct ArrowFooter
     batches: [ArrowBlock]
     version: Int
 
-// The eight bytes a file begins and ends with — `ARROW1\0\0`.
+// The eight bytes a file begins with, `ARROW1\0\0`.
+//
+// A file ends with the first six of them, `ARROW1`, after the footer's
+// length (the columnar specification, "IPC File Format").
 pub fn file_magic() -> Bytes
-    todo("arrow-nv.arrowipc.file_magic")
+    bytes.from_byte_list([65, 82, 82, 79, 87, 49, 0, 0])
 
 // Where the footer begins in a file of `file_len` bytes, given the
 // last ten bytes of it.
 //
 // A file ends with `<footer><int32 footer length><ARROW1\0\0>`, so
 // finding the footer costs a read of the last ten bytes and then one
-// read of the footer — which is the WHOLE argument for the file format
+// read of the footer — which is the whole argument for the file format
 // over the stream format, and why this is published as arithmetic a
 // caller can do before it has the footer.
 pub fn footer_position(tail: Bytes, file_len: Int) -> Result<Int, ArrowFault>
-    todo("arrow-nv.arrowipc.footer_position")
+    let n = bytes.len(tail)
+    if n < 10
+        return Err(ArrowFooterNotFound(arrowfault.at_byte(-1, file_len - n)))
+    if not magic_at(tail, n - 6)
+        return Err(ArrowBadMagic(arrowfault.at_byte(-1, file_len - 6)))
+    let footer_len = int32(tail, n - 10)
+    let at = file_len - 10 - footer_len
+    if footer_len < 0 or at < 8
+        return Err(ArrowFooterNotFound(arrowfault.at_byte(-1, file_len - 10)))
+    Ok(at)
 
 // The footer at `at`.
 pub fn read_footer(src: Bytes, at: Int, len: Int) -> Result<ArrowFooter, ArrowFault>
-    todo("arrow-nv.arrowipc.read_footer")
+    let meta = metadata(src, at, len)!
+    let root = arrowfb.root_table(meta)!
+    let version = arrowfb.field_int(meta, root, 0, 2, 0)! + 1
+    let (s_at, has) = arrowfb.field_table(meta, root, 1)!
+    if not has
+        return Err(ArrowFooterNotFound(arrowfault.at_byte(-1, at)))
+    let s = schema_at(meta, s_at)!
+    Ok(ArrowFooter { schema: s,
+        dictionaries: blocks(meta, root, 2)!,
+        batches: blocks(meta, root, 3)!,
+        version: version })
 
 // The blocks a projection over these columns needs, in file order.
 //
-// Every block, because Arrow's file format indexes MESSAGES and not
+// Every block, because Arrow's file format indexes messages and not
 // columns: a record batch's buffers are contiguous and a projection
 // reads a subset of them, but the message is one message.  This is
 // published so the answer is visible rather than assumed — a caller
 // that expected column-level seeking wants parquet-nv, and the
 // difference between the two formats is exactly this.
 pub fn blocks_for(f: ArrowFooter, names: [Str]) -> Result<[ArrowBlock], ArrowFault>
-    todo("arrow-nv.arrowipc.blocks_for")
+    for name in names
+        if arrowtype.field_index(f.schema, name) < 0
+            return Err(ArrowIndexOutOfRange(-1, list.len(f.schema.fields), arrowfault.at_field(name)))
+    Ok(f.batches[:])
 
-// The byte ranges within one block's body that a projection over these
-// columns actually needs.
+// The byte ranges within a record batch message's body that a
+// projection over these columns needs, counted from the start of the
+// body.
 //
-// The half that IS worth having: a batch's buffers are contiguous per
-// column in the walk order, so a projection is a handful of ranges
-// rather than the whole body — and a host reading over a network can
-// issue those ranges.  Answers them coalesced, because two ranges
-// eighty bytes apart are one request.
-pub fn ranges_for(f: ArrowFooter, b: ArrowBlock, names: [Str]) -> Result<[ArrowBuffer], ArrowFault>
-    todo("arrow-nv.arrowipc.ranges_for")
+// A batch's buffers are contiguous per column in the walk order, so a
+// projection is a handful of ranges rather than the whole body, and a
+// host reading over a network can issue those ranges.  Ranges less than
+// 4096 bytes apart are answered as one, and empty buffers are left out.
+// `ArrowIndexOutOfRange` names a column the schema does not have.
+
+pub fn ranges_for(src: Bytes, h: ArrowMessageHeader, s: ArrowSchema,
+                  names: [Str]) -> Result<[ArrowBuffer], ArrowFault>
+    let (meta, head) = header_table(src, h, ArrowRecordBatchMessage)!
+    var spans: [(Int, Int)] = []
+    var walk = BatchWalk { nodes: 0, buffers: 0 }
+    for f in s.fields
+        let wanted = list.contains(names, f.name)
+        let first = walk.buffers
+        node(src, h, meta, head, f, f.name, walk)!
+        if wanted
+            for k in first..walk.buffers
+                let b = buffer_at(meta, head, k)!
+                if b.len > 0
+                    list.push(spans, (b.start, b.start + b.len))
+    for name in names
+        if arrowtype.field_index(s, name) < 0
+            return Err(ArrowIndexOutOfRange(-1, list.len(s.fields), arrowfault.at_field(name)))
+    list.sort(spans)
+    var out: [ArrowBuffer] = []
+    for span in spans
+        let (from, to) = span
+        let k = list.len(out) - 1
+        if k >= 0 and from <= arrowbuf.end_of(out[k]) + 4096
+            if to > arrowbuf.end_of(out[k])
+                out[k] = ArrowBuffer { start: out[k].start, len: to - out[k].start }
+        else
+            list.push(out, ArrowBuffer { start: from, len: to - from })
+    Ok(out)
 
 // ── Taking a whole stream from a host ───────────────────────────────
 
@@ -316,9 +507,12 @@ pub fn ranges_for(f: ArrowFooter, b: ArrowBlock, names: [Str]) -> Result<[ArrowB
 // inside an archive, a frame at a time off a socket — and use this
 // otherwise.
 //
-// It MATERIALISES: the events it answers carry batches over a body this
+// It materialises: the events it answers carry batches over a body this
 // call read into memory, so a stream larger than memory wants `feed`.
-// Saying so in the signature is not possible, so it is said here.
+// The source is read 65536 bytes at a time until it answers no bytes or
+// `IoClosed`; any other failure of the source is `ArrowShortBody` at the
+// offset reached.
+
 //
 // ```novo
 // use arrowipc
@@ -330,4 +524,376 @@ pub fn ranges_for(f: ArrowFooter, b: ArrowBlock, names: [Str]) -> Result<[ArrowB
 //     println("a core reader, charged what the host's source costs")
 // ```
 pub fn read_all<S: Read[e]>(src: S, mode: ArrowIpcMode) -> Result<[ArrowIpcEvent], ArrowFault> [e]
-    todo("arrow-nv.arrowipc.read_all")
+    var parts: [Bytes] = []
+    var total = 0
+    loop
+        match src.read(65536)
+            Err(e)    =>
+                if e != IoClosed
+                    return Err(ArrowShortBody(total + 1, total, arrowfault.at_byte(-1, total)))
+                break
+            Ok(chunk) =>
+                if bytes.len(chunk) == 0
+                    break
+                total = total + bytes.len(chunk)
+                list.push(parts, bytes.clone(chunk))
+    let all = bytes.concat(parts)
+    let step = feed(reader(mode), all, 0)!
+    var events = step.events[:]
+    list.append(events, finish(step.reader)!)
+    Ok(events)
+
+// ── the parts the reader shares ─────────────────────────────────────
+
+// A reader with other limits or framing, and the rest of its state kept.
+fn with_state(r: ArrowIpcReader, meta_cap: Int, body_cap: Int, legacy: Bool) -> ArrowIpcReader
+    ArrowIpcReader { mode: r.mode, metadata_limit: meta_cap, body_limit: body_cap, legacy: legacy,
+                     messages: r.messages, schema: r.schema, dictionaries: r.dictionaries, started: r.started,
+                     ended: r.ended, waiting: r.waiting, wanting: r.wanting }
+
+fn started(r: ArrowIpcReader) -> ArrowIpcReader
+    ArrowIpcReader { mode: r.mode, metadata_limit: r.metadata_limit, body_limit: r.body_limit, legacy: r.legacy,
+                     messages: r.messages, schema: r.schema, dictionaries: r.dictionaries, started: true,
+                     ended: r.ended, waiting: r.waiting, wanting: r.wanting }
+
+fn ended(r: ArrowIpcReader) -> ArrowIpcReader
+    ArrowIpcReader { mode: r.mode, metadata_limit: r.metadata_limit, body_limit: r.body_limit, legacy: r.legacy,
+                     messages: r.messages + 1, schema: r.schema, dictionaries: r.dictionaries, started: r.started,
+                     ended: true, waiting: 0, wanting: 0 }
+
+fn waiting(r: ArrowIpcReader, left: Int, want: Int) -> ArrowIpcReader
+    ArrowIpcReader { mode: r.mode, metadata_limit: r.metadata_limit, body_limit: r.body_limit, legacy: r.legacy,
+                     messages: r.messages, schema: r.schema, dictionaries: r.dictionaries, started: r.started,
+                     ended: r.ended, waiting: left, wanting: want }
+
+// A fault from a message's own offsets moved onto the stream.
+fn in_message<T>(r: Result<T, ArrowFault>, cur: ArrowIpcReader,
+                 chunk_at: Int) -> Result<T, ArrowFault>
+    match r
+        Ok(v)  => Ok(v)
+        Err(f) => Err(arrowfault.in_message(f, cur.messages, chunk_at))
+
+// What one whole message does to the reader, and the event it answers.
+fn message(cur: ArrowIpcReader, chunk: Bytes,
+           h: ArrowMessageHeader) -> Result<(ArrowIpcReader, ArrowIpcEvent), ArrowFault>
+    let next = ArrowIpcReader { mode: cur.mode, metadata_limit: cur.metadata_limit, body_limit: cur.body_limit,
+                                legacy: cur.legacy, messages: cur.messages + 1, schema: cur.schema,
+                                dictionaries: cur.dictionaries, started: cur.started, ended: false, waiting: 0,
+                                wanting: 0 }
+    if h.kind == ArrowTensorMessage
+        return Ok((next, ArrowMessageSkipped("tensor", h.body_len)))
+    if h.kind == ArrowSchemaMessage
+        if cur.schema != None
+            return Err(ArrowUnexpectedMessage("schema", "dictionary or record batch", arrowfault.at_byte(-1, h.metadata_at)))
+        let s = read_schema(chunk, h)!
+        if s.endianness == ArrowBig
+            return Err(ArrowEndianMismatch(arrowfault.at_byte(-1, h.metadata_at)))
+        let with_schema = ArrowIpcReader { mode: next.mode, metadata_limit: next.metadata_limit,
+                                           body_limit: next.body_limit, legacy: next.legacy, messages: next.messages,
+                                           schema: Some(s), dictionaries: next.dictionaries, started: next.started,
+                                           ended: false, waiting: 0, wanting: 0 }
+        return Ok((with_schema, ArrowSchemaSeen(s)))
+    let Some(s) = cur.schema else return Err(ArrowUnexpectedMessage(kind_text(h.kind), "schema", arrowfault.at_byte(-1, h.metadata_at)))
+    if h.kind == ArrowDictionaryBatchMessage
+        let (entry, delta) = read_dictionary(chunk, h, s)!
+        let dicts = arrowcol.install_dictionary(cur.dictionaries, entry, delta)
+        let with_dict = ArrowIpcReader { mode: next.mode, metadata_limit: next.metadata_limit,
+                                         body_limit: next.body_limit, legacy: next.legacy, messages: next.messages,
+                                         schema: next.schema, dictionaries: dicts, started: next.started,
+                                         ended: false, waiting: 0, wanting: 0 }
+        return Ok((with_dict, ArrowDictionarySeen(entry.id, entry.values, delta, h.body_at, h.body_len)))
+    let b = read_batch(chunk, h, s, cur.dictionaries)!
+    Ok((next, ArrowBatchSeen(b, h.body_at, h.body_len)))
+
+fn kind_text(k: ArrowMessageKind) -> Str
+    match k
+        ArrowSchemaMessage          => "schema"
+        ArrowDictionaryBatchMessage => "dictionary batch"
+        ArrowRecordBatchMessage     => "record batch"
+        ArrowTensorMessage          => "tensor"
+        ArrowEndOfStream            => "end of stream"
+
+// An unsigned 32-bit word at `at`, or -1 past the end.
+fn word(src: Bytes, at: Int) -> Int
+    if at + 4 > bytes.len(src)
+        return -1
+    var v = 0
+    for k in 0..4
+        v = v | ((bytes.byte_at(src, at + k) ?? 0) << (8 * k))
+    v
+
+fn int32(src: Bytes, at: Int) -> Int
+    let v = word(src, at)
+    if v >= 2147483648
+        v - 4294967296
+    else
+        v
+
+fn magic_at(src: Bytes, at: Int) -> Bool
+    let want = [65, 82, 82, 79, 87, 49]
+    for k in 0..6
+        if (bytes.byte_at(src, at + k) ?? -1) != want[k]
+            return false
+    true
+
+// Whether the bytes from `at` are exactly a file's footer, its length
+// and the trailing magic.
+fn trailer_at(src: Bytes, at: Int) -> Bool
+    let n = bytes.len(src)
+    n - at >= 10 and magic_at(src, n - 6) and at + int32(src, n - 10) + 10 == n
+
+// A message's prefix: whether the continuation marker was there, where
+// the metadata starts, and its length.
+fn frame(src: Bytes, at: Int, legacy: Bool) -> Result<(Bool, Int, Int), ArrowFault>
+    let first = word(src, at)
+    if first < 0
+        return Err(ArrowShortMetadata(at + 4, bytes.len(src), arrowfault.at_byte(-1, at)))
+    if first == 4294967295
+        if word(src, at + 4) < 0
+            return Err(ArrowShortMetadata(at + 8, bytes.len(src), arrowfault.at_byte(-1, at)))
+        let len = int32(src, at + 4)
+        if len < 0
+            return Err(ArrowNegativeLength(len, arrowfault.at_byte(-1, at + 4)))
+        return Ok((true, at + 8, len))
+    if not legacy
+        return Err(ArrowBadContinuation(first, arrowfault.at_byte(-1, at)))
+    let len = int32(src, at)
+    if len < 0
+        return Err(ArrowNegativeLength(len, arrowfault.at_byte(-1, at)))
+    Ok((false, at + 4, len))
+
+// The metadata bytes of a message, copied out so that FlatBuffers
+// offsets count from zero.
+fn metadata(src: Bytes, at: Int, len: Int) -> Result<Bytes, ArrowFault>
+    if at + len > bytes.len(src)
+        return Err(ArrowShortMetadata(at + len, bytes.len(src), arrowfault.at_byte(-1, at)))
+    Ok(bytes.slice(src, at, at + len))
+
+// The metadata and the header table of a message of this kind.
+fn header_table(src: Bytes, h: ArrowMessageHeader,
+                kind: ArrowMessageKind) -> Result<(Bytes, ArrowFbPos), ArrowFault>
+    if h.kind != kind
+        return Err(ArrowUnexpectedMessage(kind_text(h.kind), kind_text(kind), arrowfault.at_byte(-1, h.metadata_at)))
+    let meta = metadata(src, h.metadata_at, h.metadata_len)!
+    let root = arrowfb.root_table(meta)!
+    let (head, present) = arrowfb.field_table(meta, root, 2)!
+    if not present
+        return Err(ArrowShortMetadata(0, 0, arrowfault.at_byte(-1, h.metadata_at)))
+    Ok((meta, head))
+
+// A record batch table's compression field, refused when present.
+fn uncompressed(meta: Bytes, batch: ArrowFbPos) -> Result<Unit, ArrowFault>
+    let (_, present) = arrowfb.field_table(meta, batch, 3)!
+    if present
+        return Err(ArrowTypeUnsupported("body compression, which arrow-nv does not decompress", arrowfault.nowhere()))
+    Ok()
+
+// ── the schema ──────────────────────────────────────────────────────
+
+fn schema_at(meta: Bytes, t: ArrowFbPos) -> Result<ArrowSchema, ArrowFault>
+    let endian = if arrowfb.field_int(meta, t, 0, 2, 0)! == 1
+        ArrowBig
+    else
+        ArrowLittle
+    var fields: [ArrowField] = []
+    for i in 0..arrowfb.field_vector_len(meta, t, 1)!
+        list.push(fields, field_at(meta, arrowfb.vector_table_at(meta, t, 1, i)!, "")!)
+    Ok(arrowtype.schema_with(fields, key_values(meta, t, 2)!, endian))
+
+fn key_values(meta: Bytes, t: ArrowFbPos, id: Int) -> Result<[ArrowKeyValue], ArrowFault>
+    var out: [ArrowKeyValue] = []
+    for i in 0..arrowfb.field_vector_len(meta, t, id)!
+        let kv = arrowfb.vector_table_at(meta, t, id, i)!
+        list.push(out, ArrowKeyValue { key: arrowfb.field_str(meta, kv, 0)!,
+            value: arrowfb.field_str(meta, kv, 1)! })
+    Ok(out)
+
+fn field_at(meta: Bytes, t: ArrowFbPos, parent: Str) -> Result<ArrowField, ArrowFault>
+    let name = arrowfb.field_str(meta, t, 0)!
+    let dotted = if parent == ""
+        name
+    else
+        "${parent}.${name}"
+    let code = arrowfb.field_uint(meta, t, 2, 1, 0)!
+    let (type_at, _) = arrowfb.field_table(meta, t, 3)!
+    let data_type = match type_of(meta, code, type_at)
+        Ok(v)  => v
+        Err(f) =>
+            return Err(arrowfault.under(f, dotted))
+    var children: [ArrowField] = []
+    for i in 0..arrowfb.field_vector_len(meta, t, 5)!
+        list.push(children, field_at(meta, arrowfb.vector_table_at(meta, t, 5, i)!, dotted)!)
+    var type_ids: [Int] = []
+    if code == 14
+        let n = arrowfb.field_vector_len(meta, type_at, 1)!
+        for i in 0..n
+            list.push(type_ids, arrowfb.vector_int_at(meta, type_at, 1, i, 4)!)
+        if n == 0
+            type_ids = list.range(0, list.len(children))
+    let (d_at, has_dict) = arrowfb.field_table(meta, t, 4)!
+    var dictionary: ?ArrowDict = None
+    if has_dict
+        let (index_at, has_index) = arrowfb.field_table(meta, d_at, 1)!
+        let index_type = if has_index
+            int_type(meta, index_at)!
+        else
+            ArrowInt32
+        dictionary = Some(ArrowDict { id: arrowfb.field_int(meta, d_at, 0, 8, 0)!, index_type: index_type,
+                                      ordered: arrowfb.field_bool(meta, d_at, 2, false)! })
+    Ok(ArrowField { name: name, data_type: data_type, nullable: arrowfb.field_bool(meta, t, 1, false)!,
+                    children: children, dictionary: dictionary, type_ids: type_ids,
+                    metadata: key_values(meta, t, 6)! })
+
+fn time_unit(code: Int) -> ArrowTimeUnit
+    match code
+        0 => ArrowSecond
+        1 => ArrowMilli
+        2 => ArrowMicro
+        _ => ArrowNano
+
+fn int_type(meta: Bytes, t: ArrowFbPos) -> Result<ArrowType, ArrowFault>
+    let width = arrowfb.field_int(meta, t, 0, 4, 0)!
+    let signed = arrowfb.field_bool(meta, t, 1, false)!
+    match (width, signed)
+        (8, true)   => Ok(ArrowInt8)
+        (16, true)  => Ok(ArrowInt16)
+        (32, true)  => Ok(ArrowInt32)
+        (64, true)  => Ok(ArrowInt64)
+        (8, false)  => Ok(ArrowUInt8)
+        (16, false) => Ok(ArrowUInt16)
+        (32, false) => Ok(ArrowUInt32)
+        (64, false) => Ok(ArrowUInt64)
+        _           => Err(ArrowTypeInvalid("an integer of ${width} bits", arrowfault.nowhere()))
+
+// The type a `Type` union member names (Schema.fbs, `union Type`).
+fn type_of(meta: Bytes, code: Int, t: ArrowFbPos) -> Result<ArrowType, ArrowFault>
+    match code
+        1  => Ok(ArrowNull)
+        2  => int_type(meta, t)
+        3  =>
+            let p = arrowfb.field_int(meta, t, 0, 2, 0)!
+            Ok((if p == 0 then ArrowFloat16 else (if p == 1 then ArrowFloat32 else ArrowFloat64)))
+        4  => Ok(ArrowBinary)
+        5  => Ok(ArrowUtf8)
+        6  => Ok(ArrowBool)
+        7  =>
+            let precision = arrowfb.field_int(meta, t, 0, 4, 0)!
+            let scale = arrowfb.field_int(meta, t, 1, 4, 0)!
+            let width = arrowfb.field_int(meta, t, 2, 4, 128)!
+            Ok((if width == 256 then ArrowDecimal256(precision, scale) else ArrowDecimal128(precision, scale)))
+        8  => Ok((if arrowfb.field_int(meta, t, 0, 2, 1)! == 0 then ArrowDate32 else ArrowDate64))
+        9  =>
+            let unit = time_unit(arrowfb.field_int(meta, t, 0, 2, 1)!)
+            Ok((if arrowfb.field_int(meta, t, 1, 4, 32)! == 32 then ArrowTime32(unit) else ArrowTime64(unit)))
+        10 => Ok(ArrowTimestamp(time_unit(arrowfb.field_int(meta, t, 0, 2, 0)!), arrowfb.field_str(meta, t, 1)!))
+        11 =>
+            let u = arrowfb.field_int(meta, t, 0, 2, 0)!
+            Ok(ArrowInterval((if u == 0 then ArrowYearMonth else (if u == 1 then ArrowDayTime else ArrowMonthDayNano))))
+        12 => Ok(ArrowList)
+        13 => Ok(ArrowStruct)
+        14 => Ok(ArrowUnion((if arrowfb.field_int(meta, t, 0, 2, 0)! == 1 then ArrowDenseUnion else ArrowSparseUnion)))
+        15 => Ok(ArrowFixedSizeBinary(arrowfb.field_int(meta, t, 0, 4, 0)!))
+        16 => Ok(ArrowFixedSizeList(arrowfb.field_int(meta, t, 0, 4, 0)!))
+        17 => Ok(ArrowMap(arrowfb.field_bool(meta, t, 0, false)!))
+        18 => Ok(ArrowDuration(time_unit(arrowfb.field_int(meta, t, 0, 2, 1)!)))
+        19 => Ok(ArrowLargeBinary)
+        20 => Ok(ArrowLargeUtf8)
+        21 => Ok(ArrowLargeList)
+        22 => Err(ArrowTypeUnsupported("RunEndEncoded", arrowfault.nowhere()))
+        23 => Err(ArrowTypeUnsupported("BinaryView", arrowfault.nowhere()))
+        24 => Err(ArrowTypeUnsupported("Utf8View", arrowfault.nowhere()))
+        25 => Err(ArrowTypeUnsupported("ListView", arrowfault.nowhere()))
+        26 => Err(ArrowTypeUnsupported("LargeListView", arrowfault.nowhere()))
+        _  => Err(ArrowUnknownType(code, arrowfault.nowhere()))
+
+fn installed(dicts: [ArrowDictEntry], id: Int) -> Bool
+    for d in dicts
+        if d.id == id
+            return true
+    false
+
+// The dictionary-encoded field with this id, searching nested fields.
+fn dictionary_field(fields: [ArrowField], id: Int) -> ?ArrowField
+    for f in fields
+        if let Some(d) = f.dictionary
+            if d.id == id
+                return Some(f)
+        if let Some(inner) = dictionary_field(f.children, id)
+            return Some(inner)
+    None
+
+// ── the batch walk ──────────────────────────────────────────────────
+
+// How far the pre-order walk has got through the metadata's node and
+// buffer lists.
+struct BatchWalk
+    var nodes: Int
+    var buffers: Int
+
+// Buffer `k` of a record batch table, relative to the body.
+fn buffer_at(meta: Bytes, batch: ArrowFbPos, k: Int) -> Result<ArrowBuffer, ArrowFault>
+    let at = arrowfb.vector_struct_at(meta, batch, 2, k, 16)!
+    Ok(ArrowBuffer { start: arrowfb.struct_int(meta, at, 0, 8)!,
+        len: arrowfb.struct_int(meta, at, 8, 8)! })
+
+// The array for one field and its children, taking the next node and
+// buffers from the walk, which it advances.  Spans are moved from the
+// body onto `src`.
+fn node(src: Bytes, h: ArrowMessageHeader, meta: Bytes, batch: ArrowFbPos, f: ArrowField, path: Str,
+        var walk: BatchWalk) -> Result<ArrowArray, ArrowFault>
+    let nodes = arrowfb.field_vector_len(meta, batch, 1)!
+    if walk.nodes >= nodes
+        return Err(ArrowNodeCountWrong(walk.nodes + 1, nodes, arrowfault.at_field(path)))
+    let at = arrowfb.vector_struct_at(meta, batch, 1, walk.nodes, 16)!
+    let length = arrowfb.struct_int(meta, at, 0, 8)!
+    let nulls = arrowfb.struct_int(meta, at, 8, 8)!
+    if length < 0 or nulls < 0
+        return Err(ArrowNegativeLength((if length < 0 then length else nulls), arrowfault.at_field(path)))
+    walk.nodes = walk.nodes + 1
+    let t = match f.dictionary
+        Some(d) => d.index_type
+        None    => f.data_type
+    var buffers: [ArrowBuffer] = []
+    let count = arrowtype.buffer_count_of(t)
+    let total = arrowfb.field_vector_len(meta, batch, 2)!
+    for _ in 0..count
+        if walk.buffers >= total
+            return Err(ArrowBufferCountWrong(walk.buffers + 1, total, arrowfault.at_field(path)))
+        let b = buffer_at(meta, batch, walk.buffers)!
+        if b.start < 0 or b.len < 0 or b.start + b.len > h.body_len
+            return Err(ArrowShortBody(b.start + b.len,
+                h.body_len,
+                arrowfault.at_buffer(-1, path, walk.buffers, h.body_at + b.start)))
+        list.push(buffers, ArrowBuffer { start: h.body_at + b.start, len: b.len })
+        walk.buffers = walk.buffers + 1
+    var children: [ArrowArray] = []
+    if f.dictionary == None
+        for c in f.children
+            list.push(children, node(src, h, meta, batch, c, "${path}.${c.name}", walk)!)
+    let id = match f.dictionary
+        Some(d) => d.id
+        None    => -1
+    Ok(ArrowArray { data_type: t, length: length, null_count: nulls, offset: 0, buffers: buffers, children: children,
+                    dictionary_id: id })
+
+// Refuse a batch whose node or buffer list is longer than the walk.
+fn counts(meta: Bytes, batch: ArrowFbPos, walk: BatchWalk, nodes: Int,
+          buffers: Int) -> Result<Unit, ArrowFault>
+    let got_nodes = arrowfb.field_vector_len(meta, batch, 1)!
+    if got_nodes != nodes
+        return Err(ArrowNodeCountWrong(nodes, got_nodes, arrowfault.nowhere()))
+    let got_buffers = arrowfb.field_vector_len(meta, batch, 2)!
+    if got_buffers != buffers
+        return Err(ArrowBufferCountWrong(buffers, got_buffers, arrowfault.nowhere()))
+    Ok()
+
+// ── the footer ──────────────────────────────────────────────────────
+
+fn blocks(meta: Bytes, t: ArrowFbPos, id: Int) -> Result<[ArrowBlock], ArrowFault>
+    var out: [ArrowBlock] = []
+    for i in 0..arrowfb.field_vector_len(meta, t, id)!
+        let at = arrowfb.vector_struct_at(meta, t, id, i, 24)!
+        list.push(out, ArrowBlock { offset: arrowfb.struct_int(meta, at, 0, 8)!,
+                                    metadata_len: arrowfb.struct_int(meta, at, 8, 4)!,
+                                    body_len: arrowfb.struct_int(meta, at, 16, 8)! })
+    Ok(out)
