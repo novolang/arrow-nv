@@ -682,6 +682,8 @@ fn test_the_remaining_calls_by_name()
     test.assert_eq(arrowbuf.count_set(bytes.from_byte_list([13]), arrowbuf.buffer(0, 1), 0, 8), 3)
     test.assert(arrowtype.is_nested(ArrowStruct))
     test.assert(not arrowtype.is_nested(ArrowInt8))
+    test.assert(arrowtype.has_offsets(ArrowMap(false)))
+    test.assert(not arrowtype.has_offsets(ArrowFixedSizeList(2)))
     test.assert_eq(arrowipc.default_body_limit(), 2147483647)
     let root = ArrowFbTable([ArrowFbRef(ArrowFbTables([ArrowFbTable([ArrowFbScalar(9, 4)])])),
                              ArrowFbRef(ArrowFbStructs(words([3, 4]), 16))])
