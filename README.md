@@ -261,7 +261,7 @@ novo test tests/arrowipc_tests.nv      # 10 tests: the framing and the reader
 novo test tests/arrowwrite_tests.nv    #  7 tests: the writer
 novo test tests/golden_tests.nv        # 39 tests: Apache Arrow's own integration files
 novo test tests/edges_tests.nv         # 12 tests: the tables over every type, the faults, time
-novo test tests/ipc_edges_tests.nv     # 18 tests: hand-made messages, the writer, the frame traits
+novo test tests/ipc_edges_tests.nv     # 19 tests: hand-made messages, the writer, the frame traits
 bash tests/coverage.sh                 # line coverage over src/, merged across the suites
 ```
 

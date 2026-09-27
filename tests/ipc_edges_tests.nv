@@ -718,3 +718,38 @@ fn test_the_remaining_calls_by_name()
                     test.assert(arrowcol.int_at(entry.body, entry.values, 0) == Ok(42))
                 Err(e)   => test.fail(e.message())
         Err(e) => test.fail(e.message())
+
+@test
+fn test_the_walks_name_what_the_schema_does_not()
+    let child = arrowcol.array(ArrowInt8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 1)])
+    let st = arrowcol.nested_array(ArrowStruct, 1, 0, [arrowbuf.no_buffer()], [child])
+    let s = arrowtype.schema([arrowtype.nested_field("st", ArrowStruct, true, [])])
+    let b = arrowcol.batch(s, [st, child], 1)
+    test.assert_eq(arrowcol.node_paths(b), ["st", "st.0", "1"])
+    // A list with offsets and no child: its values are counted as none.
+    let body = bytes.from_byte_list([0, 0, 0, 0, 3, 0, 0, 0])
+    let list_col = arrowcol.array(ArrowList, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8)])
+    test.assert_eq(list.len(arrowcol.validate(body, list_col, "l")), 2)
+    // A dictionary of floats drains as floats.
+    let values = arrowcol.array(ArrowFloat64, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8)])
+    let fs = arrowtype.schema([arrowtype.dict_field("f", ArrowFloat64, ArrowInt8, 1, false, true)])
+    let idx = arrowcol.dict_array(ArrowInt8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 1)], 1)
+    let fb = arrowcol.batch_with_dicts(fs, [idx], 1, [ArrowDictEntry { id: 1, values: values,
+                                                                        body: bytes.from_byte_list([0, 0, 0, 0, 0, 0, 248, 63]) }])
+    match arrowdf.drain_batch(bytes.zeros(1), fb, Log { lines: [] })
+        Ok(log) => test.assert_eq(log.lines, ["f floats [1.5] [true]"])
+        Err(e)  => test.fail(e.message())
+    // A dictionary encoding with no index type is indexed by Int32.
+    let dict = ArrowFbTable([ArrowFbScalar(3, 8)])
+    let field = ArrowFbTable([ArrowFbRef(ArrowFbString("x")), ArrowFbScalar(1, 1), ArrowFbScalar(5, 1), ArrowFbRef(ArrowFbTable([])),
+                              ArrowFbRef(dict), ArrowFbRef(ArrowFbTables([]))])
+    let schema = ArrowFbTable([ArrowFbScalar(0, 2), ArrowFbRef(ArrowFbTables([field]))])
+    match feed_all(framed(message(4, 1, ArrowFbRef(schema), 0), bytes.zeros(0)))
+        Ok(step) =>
+            match step.events[0]
+                ArrowSchemaSeen(got) =>
+                    match got.fields[0].dictionary
+                        Some(d) => test.assert(d.index_type == ArrowInt32)
+                        None    => test.fail("the dictionary was dropped")
+                _                    => test.fail("expected the schema")
+        Err(e)   => test.fail(e.message())
