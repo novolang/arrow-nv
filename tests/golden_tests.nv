@@ -7,7 +7,6 @@
 use std.test
 use std.bytes
 use std.list
-use std.float
 use arrowipc
 use arrowtype
 use arrowbuf

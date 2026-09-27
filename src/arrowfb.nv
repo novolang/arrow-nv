@@ -170,7 +170,6 @@ pub fn struct_int(meta: Bytes, s: ArrowFbPos, at: Int, width: Int) -> Result<Int
 // `encode` answers a builder with `used` and `vtables` filled in, so a
 // caller can see how large the buffer came out and how many vtables
 // were shared.
-
 pub struct ArrowFbBuilder
     // The most bytes `encode` may lay down.
     capacity: Int
@@ -190,7 +189,6 @@ pub fn builder(capacity: Int) -> ArrowFbBuilder
 // Each node and each buffer is a 16-byte struct, and the tables around
 // them take under 128 bytes.  `arrowwrite.metadata_bound` answers the
 // exact size for a batch in hand.
-
 pub fn metadata_bound(nodes: Int, buffers: Int, fields: Int) -> Int
     // The message table, the record batch table and their vtables take
     // under 128 bytes; each node and each buffer is one 16-byte struct;

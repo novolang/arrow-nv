@@ -193,7 +193,6 @@ head = '''// golden_tests.nv — Apache Arrow's own integration files, read and
 use std.test
 use std.bytes
 use std.list
-use std.float
 use arrowipc
 use arrowtype
 use arrowbuf

@@ -8,7 +8,6 @@
 use std.test
 use std.bytes
 use std.list
-use std.str
 use arrowfault
 use arrowtype
 use arrowbuf
@@ -676,3 +675,44 @@ fn test_the_last_corners_of_the_arrays_and_the_frame()
                    [ArrowTypeInvalid("a time64 in milliseconds", arrowfault.nowhere())])
     let nested = arrowtype.schema([arrowtype.nested_field("l", ArrowList, true, [arrowtype.field("i", ArrowInt8, true)])])
     test.assert(arrowtype.schema_compatible(nested, nested))
+
+@test
+fn test_the_remaining_calls_by_name()
+    test.assert_eq(arrowbuf.end_of(arrowbuf.buffer(8, 4)), 12)
+    test.assert_eq(arrowbuf.count_set(bytes.from_byte_list([13]), arrowbuf.buffer(0, 1), 0, 8), 3)
+    test.assert(arrowtype.is_nested(ArrowStruct))
+    test.assert(not arrowtype.is_nested(ArrowInt8))
+    test.assert_eq(arrowipc.default_body_limit(), 2147483647)
+    let root = ArrowFbTable([ArrowFbRef(ArrowFbTables([ArrowFbTable([ArrowFbScalar(9, 4)])])),
+                             ArrowFbRef(ArrowFbStructs(words([3, 4]), 16))])
+    let meta = meta_of(root)
+    match arrowfb.root_table(meta)
+        Ok(t)  =>
+            match arrowfb.vector_table_at(meta, t, 0, 0)
+                Ok(inner) => test.assert(arrowfb.field_int(meta, inner, 0, 4, 0) == Ok(9))
+                Err(e)    => test.fail(e.message())
+            match arrowfb.vector_struct_at(meta, t, 1, 0, 16)
+                Ok(at) =>
+                    test.assert(arrowfb.struct_int(meta, at, 0, 8) == Ok(3))
+                    test.assert(arrowfb.struct_int(meta, at, 8, 8) == Ok(4))
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // A dictionary batch read on its own: its values and whether it is a
+    // delta.
+    let s = arrowtype.schema([arrowtype.dict_field("d", ArrowInt8, ArrowInt8, 5, false, true)])
+    let data = batch_table(1, [1, 0], [0, 0, 0, 1])
+    let msg = framed(message(4,
+        2,
+        ArrowFbRef(ArrowFbTable([ArrowFbScalar(5, 8), ArrowFbRef(data), ArrowFbScalar(1, 1)])),
+        8),
+                     bytes.from_byte_list([42, 0, 0, 0, 0, 0, 0, 0]))
+    match arrowipc.read_header(msg, 0, false)
+        Ok(h)  =>
+            match arrowipc.read_dictionary(msg, h, s)
+                Ok(pair) =>
+                    let (entry, delta) = pair
+                    test.assert(delta)
+                    test.assert_eq(entry.id, 5)
+                    test.assert(arrowcol.int_at(entry.body, entry.values, 0) == Ok(42))
+                Err(e)   => test.fail(e.message())
+        Err(e) => test.fail(e.message())

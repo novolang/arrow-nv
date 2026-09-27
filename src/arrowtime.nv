@@ -29,7 +29,6 @@
 // before 1970 lands on the right day.
 
 use civil
-use span
 use arrowfault
 use arrowtype
 

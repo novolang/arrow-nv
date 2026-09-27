@@ -228,7 +228,6 @@ pub fn feed(r: ArrowIpcReader, chunk: Bytes, chunk_at: Int) -> Result<ArrowIpcSt
 // `ArrowShortBody` for a stream that stopped inside a message, which is
 // what separates "done" from "the connection dropped".  A file whose
 // footer was never read is `ArrowFooterNotFound`.
-
 pub fn finish(r: ArrowIpcReader) -> Result<[ArrowIpcEvent], ArrowFault>
     if r.ended
         return Ok([])
@@ -461,7 +460,6 @@ pub fn blocks_for(f: ArrowFooter, names: [Str]) -> Result<[ArrowBlock], ArrowFau
 // host reading over a network can issue those ranges.  Ranges less than
 // 4096 bytes apart are answered as one, and empty buffers are left out.
 // `ArrowIndexOutOfRange` names a column the schema does not have.
-
 pub fn ranges_for(src: Bytes, h: ArrowMessageHeader, s: ArrowSchema,
                   names: [Str]) -> Result<[ArrowBuffer], ArrowFault>
     let (meta, head) = header_table(src, h, ArrowRecordBatchMessage)!

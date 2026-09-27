@@ -27,7 +27,6 @@
 use std.bytes
 use std.float
 use std.list
-use std.str
 use arrowfault
 use arrowtype
 use arrowbuf
@@ -319,7 +318,6 @@ pub fn write_padding(written: Int, var dst: Cursor) -> Result<Int, ArrowFault>
 // id already sent goes as a delta), each batch with `write_batch`, and
 // the end, then hands the bytes to `sink` until it has taken them all.
 // A sink that fails or takes nothing is `ArrowWriteBufferTooSmall`.
-
 pub fn write_all<S: Write[e]>(mode: ArrowIpcMode, s: ArrowSchema, batches: [ArrowBatch],
                               bodies: [Bytes], sink: S) -> Result<Int, ArrowFault> [e]
     var size = schema_message_bound(s) + 8 + footer_bound(s, 0, list.len(batches)) + 8
