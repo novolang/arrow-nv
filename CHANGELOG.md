@@ -5,6 +5,83 @@ All notable changes to arrow-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.0 — 2026-09-27
+
+The first implementation of the interface published as 0.0.1: the
+schema and its checks, arrays and batches over spans, the temporal
+conversions, the FlatBuffers subset read and written, the IPC reader
+for the stream and file forms, the writer, and the data frame traits.
+It requires novo 0.13.0 and calendar-nv `^0.2.0`.
+
+### Breaking changes
+
+- `arrowipc.ranges_for` takes the message and its schema:
+  `ranges_for(src, header, schema, names)`.  The interface took a footer
+  and a block, which do not say where a column's buffers are; only the
+  message's metadata does.  The ranges are counted from the start of the
+  body, and ranges less than 4096 bytes apart are joined.
+- `ArrowFault` has four more variants: `ArrowTypeInvalid`, for a type
+  whose parameters the specification does not allow; `ArrowMisaligned`,
+  from `arrowbuf.check_alignment`; `ArrowLengthMismatch`, for a column
+  whose length is not the batch's; and `ArrowWrongType`, for an
+  accessor asked for one kind of value from a column of another.  A
+  `match` over `ArrowFault` needs the new arms.
+- `ArrowIpcReader` carries the schema, the dictionaries and its
+  position, and `ArrowWriter` has a `dictionary_blocks` list beside
+  `blocks`.  Code that built either with a struct literal needs the new
+  fields; `arrowipc.reader` and `arrowwrite.writer` are unchanged.
+- `ArrowFbBuilder` has a `capacity` field, and `arrowfb.encode`,
+  `ArrowFbObject` and `ArrowFbField` are new: the builder is what
+  `encode` may lay down and reports what it did.
+- `arrowtype.field_paths`, `node_count_of` and `buffer_count_of_schema`
+  leave out a dictionary-encoded field's children, which are not in a
+  record batch.
+
+### Added
+
+- `arrowfault.in_message`, which moves a fault's coordinates onto a
+  stream.
+- `arrowfb.encode` and the two enums it takes.
+
+### Behaviour the interface left open
+
+- A file ends with `ARROW1`, six bytes, after the footer's length; it
+  begins with the eight bytes `file_magic` answers.  `footer_position`
+  reads the last ten bytes.
+- The reader keeps no bytes: a message that straddles the end of a chunk
+  is left unconsumed and fed again.  `finish` answers `ArrowStreamEnded`
+  for a stream that ends between messages without its end marker.
+- A buffer's span in a batch the reader answers is into the chunk it
+  was fed, and a dictionary entry's body is the chunk its message came
+  in.  A dictionary delta is kept as a second entry under its id.
+- `arrowcol.slice` leaves children as they are; `struct_field` applies a
+  struct's offset to the child it answers.  `is_valid` answers `false`
+  for a `Null` array and `true` for a union, whose validity is in its
+  children.
+- `arrowdf.cell_kind_of` answers `ArrowCellFloat` for a decimal, whose
+  narrowing is `ArrowNarrowPrecisionLost`.  A nanosecond timestamp
+  narrows exactly, so no type answers `ArrowNarrowRangeLost`.
+- The writer writes metadata version V5, writes the end-of-stream
+  marker before a file's footer, and refuses an array with a non-zero
+  offset, since the metadata has no offset field.
+- `arrowwrite.write_floats` rounds to nearest with ties to even at 16
+  and 32 bits.
+
+### Tests
+
+- `tests/golden_tests.nv`, written by `tools/golden.py`, reads eighteen
+  of Apache Arrow's integration streams and three files at a fixed
+  commit of `arrow-testing`, checks every value against the JSON beside
+  them, and writes each stream back and reads it again.
+- `tests/edges_tests.nv` and `tests/ipc_edges_tests.nv` cover the tables
+  over every type, every fault, the temporal conversions, and each
+  refusal of the reader, the writer and the accessors.
+- Three API test fixtures were wrong and are corrected: the file tail
+  carried eight bytes of magic where Arrow writes six, a FlatBuffers
+  buffer's root pointed at its vtable, and a 32-bit offsets buffer read
+  as 64-bit was expected to start at zero.
+- Line coverage over `src/` is 100%, measured by `tests/coverage.sh`.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.

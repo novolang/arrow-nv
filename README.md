@@ -9,12 +9,6 @@ and the
 [IPC format](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc)
 for novo-lang, over bytes the caller already holds.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What the format is
 
 A **schema** is a list of **fields**, and a field is a name, a logical
@@ -37,14 +31,15 @@ The **IPC format** writes a schema and a sequence of batches as
 **messages**. Each message is a continuation marker, a metadata length,
 a metadata block in the FlatBuffers encoding, and a body holding the
 buffers. The **stream** form is a bare sequence ending with a
-zero-length message. The **file** form is the same sequence with
-`ARROW1\0\0` at both ends and a footer indexing every message by byte
-offset.
+zero-length message. The **file** form is the same sequence after
+`ARROW1\0\0`, followed by a footer indexing every message by byte
+offset, the footer's length, and `ARROW1`.
 
 | Quantity | Value |
 | --- | --- |
 | Continuation marker | `0xFFFFFFFF`, little-endian |
-| File magic, at both ends | `ARROW1\0\0` |
+| File magic at the start | `ARROW1\0\0`, eight bytes |
+| File magic at the end | `ARROW1`, six bytes |
 | Required buffer alignment | 8 bytes |
 | Recommended buffer alignment | 64 bytes |
 | Null count of a slice | -1, meaning not known |
@@ -89,11 +84,6 @@ fn main() [io, fs]
                             _                       => println("other message")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: arrow-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
-
 ## What the package contains
 
 | Module | Contents |
@@ -102,7 +92,7 @@ specification the implementation will have to satisfy.
 | `arrowbuf` | A buffer as a start and a length, with the bit, offset and alignment arithmetic that reads one. |
 | `arrowcol` | An array over those spans, a record batch as a tree of them, slicing, the element accessors, and the flat walks the IPC metadata needs. |
 | `arrowtime` | The temporal types: the unit ratios, the conversions to civil dates and times, and the questions to ask of a timestamp's zone. |
-| `arrowfb` | The corner of the FlatBuffers encoding Arrow's metadata uses: tables, vectors, strings and inline structs. |
+| `arrowfb` | The part of the FlatBuffers encoding Arrow's metadata uses: tables, vectors, strings and inline structs, read and written. |
 | `arrowipc` | The framing and the message envelope, a feed-and-drain reader for both forms, and the file footer. |
 | `arrowwrite` | The same two forms written into a `Cursor` the caller sized. |
 | `arrowdf` | Two traits, so a data frame or a result set can be filled from a batch or turned into one. |
@@ -192,8 +182,9 @@ implementation against the layout tables.
 15. **The file footer indexes messages, not columns.**
     `arrowipc.blocks_for` therefore answers every block for any
     projection. `arrowipc.ranges_for` answers the byte ranges within one
-    message's body that a projection needs, coalesced, which is what a
-    host reading over a network issues. A caller that wants
+    message's body that a projection needs, with ranges less than 4096
+    bytes apart joined, which is what a host reading over a network
+    issues. A caller that wants
     column-level seeking wants
     [parquet-nv](https://novo-lang.org/packages/parquet-nv).
 16. **A `Map` is a list of key-value structs, and `keys_sorted` is a
@@ -203,10 +194,15 @@ implementation against the layout tables.
 17. **The narrowing to a data frame is answered up front.** Arrow has
     thirty-odd logical types and a data frame has four.
     `arrowdf.cell_kind_of` is a function of the type alone, so a caller
-    checks its schema once. `arrowdf.narrowing_of` names the four
-    conversions that lose something: an unsigned 64-bit value past 2^63,
-    a decimal scaled into a float, nanoseconds past the year 2262, and a
-    dictionary column expanded to its values.
+    checks its schema once. `arrowdf.narrowing_of` and
+    `arrowdf.lossy_columns` name the three conversions that lose
+    something: an unsigned 64-bit value past 2^63 keeps its bits and
+    loses its sign, a decimal scaled into a float loses digits, and a
+    dictionary column is expanded to its values.
+18. **A dictionary-encoded field's children are not in the batch.**
+    Its array holds indices, and its values, children included, arrive
+    in a dictionary batch. The pre-order walk, `arrowtype.field_paths`
+    and `node_count_of` leave them out.
 
 ## What is not included
 
@@ -263,43 +259,36 @@ novo test tests/arrowtype_tests.nv     # 11 tests: the types and the layout tabl
 novo test tests/arrowcol_tests.nv      #  8 tests: arrays, slices and batches
 novo test tests/arrowipc_tests.nv      # 10 tests: the framing and the reader
 novo test tests/arrowwrite_tests.nv    #  7 tests: the writer
+novo test tests/golden_tests.nv        # 39 tests: Apache Arrow's own integration files
+novo test tests/edges_tests.nv         # 12 tests: the tables over every type, the faults, time
+novo test tests/ipc_edges_tests.nv     # 17 tests: hand-made messages, the writer, the frame traits
+bash tests/coverage.sh                 # line coverage over src/, merged across the suites
 ```
 
-The constants asserted are the specification's own: `ARROW1\0\0`, the
-`0xFFFFFFFF` continuation marker, the eight- and sixty-four-byte
-alignments, `Date64`'s multiple-of-a-day rule and the four time-unit
-ratios. The API shape follows `arrow-rs` and `pyarrow`.
+The oracle is the Apache Arrow project's integration data, from the
+`arrow-testing` repository. Arrow's C++ implementation wrote each IPC
+stream and file there beside a JSON file that spells out the same
+schema and every value. `tools/golden.py` fetches eighteen streams and
+three files at a fixed commit and writes `tests/golden_tests.nv`: the
+bytes, and a check made from the JSON of every column's length,
+validity, values, offsets and union type ids. The suite reads each
+stream, reads each file by feeding and through its footer, then writes
+every stream back out with `arrowwrite`, reads it again and runs the
+same checks. The files cover every primitive type, dates, times,
+timestamps with and without zones, durations, intervals, lists, large
+lists, fixed-size lists, structs, maps, sparse and dense unions,
+dictionaries, nested dictionaries and custom metadata.
 
-The suite asserts the six layout entries a hand-written reader gets
-wrong — a `Null` array's zero buffers, a boolean's bits, a struct's
-validity-only buffer, a fixed-size list's missing offsets, and a sparse
-and a dense union's absent bitmaps — and then that a slice shares its
-parent's buffers, that a validity bit is read at the array's offset,
-that a slice's null count is not known, that the pre-order walk pairs
-nodes with buffers, that a missing continuation marker is refused unless
-the legacy form was asked for, that a message past a limit is refused
-before anything is reserved, that a dictionary is resolved from a second
-body, and that a delta appends.
-
-The tests compile today and fail at run, each on the `not implemented`
-panic that is its body. That is the expected state of an interface
-release. They turn green one at a time as bodies land.
-
-## Implementation status
-
-Every function is declared and none is implemented.
-
-| Module | Surface | Implemented |
-| --- | --- | --- |
-| `arrowtype` | the logical types, fields, schemas, and the two layout tables | no |
-| `arrowbuf` | buffers, bitmaps, offsets, alignment and the element readers | no |
-| `arrowcol` | arrays, batches, slicing, the accessors and the flat walks | no |
-| `arrowtime` | the unit ratios and the conversions to civil values | no |
-| `arrowfb` | the FlatBuffers subset: tables, vectors, strings, inline structs | no |
-| `arrowipc` | the framing, the reader, the message readers and the footer | no |
-| `arrowwrite` | both formats, written into a caller's cursor | no |
-| `arrowdf` | the two traits and the narrowing questions | no |
-| `arrowfault` | the faults and their locations | no |
+The API suites assert the layout entries a hand-written reader gets
+wrong: a `Null` array's zero buffers, a boolean's bits, a struct's
+validity-only buffer, a fixed-size list's missing offsets, and the two
+unions' absent bitmaps. They assert that a slice shares its parent's
+buffers, that a validity bit is read at the array's offset, that a
+slice's null count is not known, that a missing continuation marker is
+refused unless the legacy form was asked for, and that a message past a
+limit is refused. The edge suites build malformed messages with
+`arrowfb.encode`, each different from a valid one in the one field under
+test, and reach every refusal.
 
 ## Licence
 
