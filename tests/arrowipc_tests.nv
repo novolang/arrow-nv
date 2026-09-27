@@ -1,16 +1,10 @@
 // arrowipc_tests.nv — the framing constants, the continuation marker
-// that was added in 0.15, the footer arithmetic, and the narrowing a
-// data frame conversion costs.
+// added in Arrow 0.15, the footer arithmetic, and the narrowing a data
+// frame conversion costs.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: arrow-nv.<module>.<fn>`.
-//
-// THE CONSTANTS ARE THE SPECIFICATION'S OWN.  `ARROW1\0\0`, the
-// `0xFFFFFFFF` continuation marker, the 8-byte required and 64-byte
-// recommended alignment, the epoch, and `Date64`'s multiple-of-a-day
-// rule are all written in the Arrow columnar and IPC specifications
-// rather than chosen here, so a port that disagrees with one of these
-// disagrees with every Arrow implementation there is.
+// The constants are the specification's own: `ARROW1`, the `0xFFFFFFFF`
+// continuation marker, the 8-byte required and 64-byte recommended
+// alignment, the epoch, and `Date64`'s multiple-of-a-day rule.
 
 use std.test
 use std.list
@@ -70,16 +64,16 @@ fn test_the_limit_crosses_the_interface_before_anything_is_allocated() [io]
 
 @test
 fn test_the_footer_is_found_from_the_last_ten_bytes() [io]
-    // <footer length = 96><ARROW1\0\0>
-    let tail = bytes.from_byte_list([96, 0, 0, 0, 65, 82, 82, 79, 87, 49, 0, 0])
+    // <footer length = 96><ARROW1>: the trailing magic has no padding.
+    let tail = bytes.from_byte_list([96, 0, 0, 0, 65, 82, 82, 79, 87, 49])
 
-    test.case("a file of 1024 bytes puts its footer at 1024 - 8 - 4 - 96")
+    test.case("a file of 1024 bytes puts its footer at 1024 - 6 - 4 - 96")
     match arrowipc.footer_position(tail, 1024)
-        Ok(at) => test.assert(at == 916)
+        Ok(at) => test.assert(at == 918)
         Err(_) => test.assert(false)
 
     test.case("a tail whose magic is wrong is not an Arrow file")
-    let bad = bytes.from_byte_list([96, 0, 0, 0, 80, 75, 3, 4, 0, 0, 0, 0])
+    let bad = bytes.from_byte_list([96, 0, 0, 0, 80, 75, 3, 4, 0, 0])
     match arrowipc.footer_position(bad, 1024)
         Ok(_)  => test.assert(false)
         Err(_) => test.assert(true)

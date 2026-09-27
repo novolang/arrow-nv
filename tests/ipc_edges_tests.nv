@@ -1,0 +1,678 @@
+// ipc_edges_tests.nv — messages made by hand to reach each refusal of
+// the reader, the FlatBuffers corner cases, the writer's refusals, and
+// the data frame traits.
+//
+// Every malformed message here is built with `arrowfb.encode`, so each
+// one differs from a valid message in the one field under test.
+
+use std.test
+use std.bytes
+use std.list
+use std.str
+use arrowfault
+use arrowtype
+use arrowbuf
+use arrowfb
+use arrowcol
+use arrowipc
+use arrowwrite
+use arrowdf
+use arrowtime
+
+fn refused<T>(r: Result<T, ArrowFault>) -> ArrowFault
+    match r
+        Ok(_)  =>
+            test.fail("a refusal was expected")
+            ArrowBadMagic(arrowfault.nowhere())
+        Err(f) => f
+
+fn meta_of(root: ArrowFbObject) -> Bytes
+    match arrowfb.encode(arrowfb.builder(1048576), root)
+        Ok(pair) =>
+            let (_, meta) = pair
+            meta
+        Err(e)   =>
+            test.fail(e.message())
+            bytes.zeros(0)
+
+// One framed message: the marker, the metadata length, the metadata and
+// the body.
+fn framed(root: ArrowFbObject, body: Bytes) -> Bytes
+    let meta = meta_of(root)
+    bytes.concat([bytes.from_byte_list([255, 255, 255, 255]), le32(bytes.len(meta)), meta, body])
+
+fn le32(v: Int) -> Bytes
+    bytes.from_byte_list([v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255])
+
+fn message(version: Int, code: Int, header: ArrowFbField, body_len: Int) -> ArrowFbObject
+    ArrowFbTable([ArrowFbScalar(version, 2), ArrowFbScalar(code, 1), header, ArrowFbScalar(body_len, 8)])
+
+fn words(values: [Int]) -> Bytes
+    var out: [Int] = []
+    for v in values
+        for k in 0..8
+            list.push(out, (v >> (8 * k)) & 255)
+    bytes.from_byte_list(out)
+
+// A record batch table with these nodes and buffers, as (a, b) pairs.
+fn batch_table(rows: Int, nodes: [Int], buffers: [Int]) -> ArrowFbObject
+    ArrowFbTable([ArrowFbScalar(rows, 8), ArrowFbRef(ArrowFbStructs(words(nodes), 16)),
+                  ArrowFbRef(ArrowFbStructs(words(buffers), 16))])
+
+fn one_int_schema() -> ArrowSchema
+    arrowtype.schema([arrowtype.field("n", ArrowInt64, true)])
+
+fn schema_bytes(s: ArrowSchema) -> Bytes
+    var c = bytes.cursor_le(bytes.zeros(arrowwrite.schema_message_bound(s)))
+    match arrowwrite.write_schema(arrowwrite.writer(ArrowStreamFormat, s), c)
+        Ok(_)  => c.finish()
+        Err(e) =>
+            test.fail(e.message())
+            bytes.zeros(0)
+
+fn eos() -> Bytes
+    bytes.from_byte_list([255, 255, 255, 255, 0, 0, 0, 0])
+
+fn feed_all(src: Bytes) -> Result<ArrowIpcStep, ArrowFault>
+    arrowipc.feed(arrowipc.reader(ArrowStreamFormat), src, 0)
+
+// ── the message envelope ────────────────────────────────────────────
+
+@test
+fn test_the_envelope_refuses_by_name()
+    let schema = schema_bytes(one_int_schema())
+    // Metadata version V3, which predates the encapsulated message.
+    test.assert_eq(refused(arrowipc.read_header(framed(message(2, 1, ArrowFbAbsent, 0), bytes.zeros(0)), 0, false)),
+                   ArrowVersionUnsupported(3, arrowfault.at_byte(-1, 8)))
+    test.assert_eq(arrowfault.kind_of(refused(arrowipc.read_header(framed(message(4, 9, ArrowFbAbsent, 0), bytes.zeros(0)), 0,
+                                                                   false))),
+                   ArrowCorrupt)
+    test.assert_eq(refused(arrowipc.read_header(framed(message(4, 3, ArrowFbAbsent, -8), bytes.zeros(0)), 0, false)),
+                   ArrowNegativeLength(-8, arrowfault.at_byte(-1, 8)))
+    test.assert_eq(refused(arrowipc.read_header(bytes.from_byte_list([255, 255]), 0, false)),
+                   ArrowShortMetadata(4, 2, arrowfault.at_byte(-1, 0)))
+    test.assert_eq(refused(arrowipc.read_header(bytes.from_byte_list([255, 255, 255, 255, 1]), 0, false)),
+                   ArrowShortMetadata(8, 5, arrowfault.at_byte(-1, 0)))
+    test.assert_eq(refused(arrowipc.read_header(bytes.slice(schema, 0, 20), 0, false)),
+                   ArrowShortMetadata(8 + bytes.len(schema) - 8, 20, arrowfault.at_byte(-1, 8)))
+    match arrowipc.read_header(eos(), 0, false)
+        Ok(h)  => test.assert(h.kind == ArrowEndOfStream)
+        Err(e) => test.fail(e.message())
+    // The pre-0.15 framing: the length with no marker in front.
+    let legacy = bytes.slice(schema, 4, bytes.len(schema))
+    match arrowipc.read_header(legacy, 0, true)
+        Ok(h)  =>
+            test.assert(not h.continuation)
+            test.assert(h.kind == ArrowSchemaMessage)
+        Err(e) => test.fail(e.message())
+    match arrowipc.feed(arrowipc.with_legacy(arrowipc.reader(ArrowStreamFormat)), legacy, 0)
+        Ok(s)  => test.assert_eq(list.len(s.events), 1)
+        Err(e) => test.fail(e.message())
+    match arrowipc.read_header(schema, 0, false)
+        Ok(h)  =>
+            test.assert_eq(arrowfault.kind_of(refused(arrowipc.read_batch(schema, h, one_int_schema(), []))),
+                ArrowCorrupt)
+            test.assert_eq(refused(arrowipc.compression_of(schema, h)),
+                           ArrowUnexpectedMessage("schema", "record batch", arrowfault.at_byte(-1, 8)))
+        Err(e) => test.fail(e.message())
+    // A message with no header table.
+    let bare = framed(message(4, 3, ArrowFbAbsent, 0), bytes.zeros(0))
+    match arrowipc.read_header(bare, 0, false)
+        Ok(h)  => test.assert_eq(refused(arrowipc.read_batch(bare, h, one_int_schema(), [])),
+            ArrowShortMetadata(0, 0, arrowfault.at_byte(-1, 8)))
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_reader_follows_the_streams_grammar()
+    let schema = schema_bytes(one_int_schema())
+    let tensor = framed(message(4, 4, ArrowFbRef(ArrowFbTable([])), 8), bytes.zeros(8))
+    match feed_all(bytes.concat([schema, tensor, eos()]))
+        Ok(s)  =>
+            test.assert_eq(list.len(s.events), 3)
+            test.assert(s.events[1] == ArrowMessageSkipped("tensor", 8))
+            test.assert(arrowipc.has_schema(s.reader))
+            test.assert(arrowipc.finish(s.reader) == Ok([]))
+            match arrowipc.feed(s.reader, bytes.zeros(0), 0)
+                Ok(again) => test.assert_eq(again.consumed, 0)
+                Err(e)    => test.fail(e.message())
+            test.assert_eq(refused(arrowipc.feed(s.reader, bytes.zeros(1), 99)),
+                           ArrowUnexpectedMessage("bytes", "nothing after the end of the stream", arrowfault.at_byte(3, 99)))
+        Err(e) => test.fail(e.message())
+    test.assert_eq(arrowfault.kind_of(refused(feed_all(bytes.concat([schema, schema])))), ArrowCorrupt)
+    let batch = framed(message(4, 3, ArrowFbRef(batch_table(0, [0, 0], [0, 0, 0, 0])), 0), bytes.zeros(0))
+    test.assert_eq(arrowfault.kind_of(refused(feed_all(batch))), ArrowCorrupt)
+    let r = arrowipc.reader(ArrowStreamFormat)
+    test.assert(not arrowipc.has_schema(r))
+    test.assert_eq(arrowfault.kind_of(refused(arrowipc.schema_of(r))), ArrowCorrupt)
+    test.assert(arrowipc.finish(r) == Ok([ArrowStreamEnded]))
+    let big_endian = schema_bytes(arrowtype.schema_with([arrowtype.field("n", ArrowInt64, true)], [], ArrowBig))
+    test.assert_eq(arrowfault.kind_of(refused(feed_all(big_endian))), ArrowUnsupported)
+    // A byte that is not a message, in the stream form.
+    test.assert_eq(arrowfault.kind_of(refused(feed_all(bytes.from_byte_list([1, 0, 0, 0, 0, 0, 0, 0])))),
+        ArrowCorrupt)
+
+@test
+fn test_the_reader_waits_for_a_message_that_straddles_the_chunk()
+    let schema = schema_bytes(one_int_schema())
+    // Half the prefix, half the metadata, and all but the body.
+    for cut in [3, 6, 20]
+        match feed_all(bytes.slice(schema, 0, cut))
+            Ok(s)  =>
+                test.assert_eq(s.consumed, 0)
+                test.assert_eq(arrowfault.kind_of(refused(arrowipc.finish(s.reader))), ArrowIncomplete)
+            Err(e) => test.fail(e.message())
+    let body = framed(message(4, 3, ArrowFbRef(batch_table(1, [1, 0], [0, 0, 0, 8])), 8), bytes.zeros(8))
+    match feed_all(bytes.concat([schema, bytes.slice(body, 0, bytes.len(body) - 4)]))
+        Ok(s)  => test.assert_eq(s.consumed, bytes.len(schema))
+        Err(e) => test.fail(e.message())
+    let tight = arrowipc.with_metadata_limit(arrowipc.reader(ArrowStreamFormat), 8)
+    test.assert_eq(arrowfault.kind_of(refused(arrowipc.feed(tight, schema, 0))), ArrowCorrupt)
+    let small = arrowipc.with_body_limit(arrowipc.reader(ArrowStreamFormat), 4)
+    test.assert_eq(arrowfault.kind_of(refused(arrowipc.feed(small, bytes.concat([schema, body]), 0))),
+        ArrowCorrupt)
+
+@test
+fn test_the_file_form_needs_its_magic_and_its_trailer()
+    let file = arrowipc.reader(ArrowFileFormat)
+    match arrowipc.feed(file, bytes.zeros(4), 0)
+        Ok(s)  => test.assert_eq(s.consumed, 0)
+        Err(e) => test.fail(e.message())
+    test.assert_eq(refused(arrowipc.feed(file, bytes.zeros(8), 0)), ArrowBadMagic(arrowfault.at_byte(0, 0)))
+    let start = bytes.concat([arrowipc.file_magic(), schema_bytes(one_int_schema()), bytes.from_byte_list([1, 2, 3, 4])])
+    match arrowipc.feed(file, start, 0)
+        Ok(s)  =>
+            test.assert_eq(s.consumed, bytes.len(start) - 4)
+            test.assert_eq(refused(arrowipc.finish(s.reader)), ArrowShortBody(5, 4, arrowfault.at_byte(1, -1)))
+        Err(e) => test.fail(e.message())
+    match arrowipc.feed(file, bytes.slice(start, 0, bytes.len(start) - 4), 0)
+        Ok(s)  => test.assert_eq(refused(arrowipc.finish(s.reader)), ArrowFooterNotFound(arrowfault.at_byte(1, -1)))
+        Err(e) => test.fail(e.message())
+    test.assert_eq(refused(arrowipc.footer_position(bytes.zeros(4), 100)),
+        ArrowFooterNotFound(arrowfault.at_byte(-1, 96)))
+    let no_schema = meta_of(ArrowFbTable([ArrowFbScalar(4, 2)]))
+    test.assert_eq(refused(arrowipc.read_footer(no_schema, 0, bytes.len(no_schema))),
+        ArrowFooterNotFound(arrowfault.at_byte(-1, 0)))
+
+@test
+fn test_the_batch_walk_refuses_a_count_that_is_not_the_schemas()
+    let schema = schema_bytes(one_int_schema())
+    let s = one_int_schema()
+    let cases = [batch_table(1, [], [0, 0, 0, 8]), batch_table(1, [-1, 0], [0, 0, 0, 8]), batch_table(1, [1, 0], [0, 0]),
+                 batch_table(1, [1, 0], [0, 0, 0, 64]), batch_table(1, [1, 0, 1, 0], [0, 0, 0, 8]),
+                 batch_table(1, [1, 0], [0, 0, 0, 8, 0, 0])]
+    let kinds = [ArrowCorrupt, ArrowCorrupt, ArrowCorrupt, ArrowIncomplete, ArrowCorrupt, ArrowCorrupt]
+    for k in 0..list.len(cases)
+        let msg = framed(message(4, 3, ArrowFbRef(cases[k]), 8), bytes.zeros(8))
+        match arrowipc.read_header(msg, 0, false)
+            Ok(h)  => test.assert_eq(arrowfault.kind_of(refused(arrowipc.read_batch(msg, h, s, []))), kinds[k])
+            Err(e) => test.fail(e.message())
+    // A compressed body is named and refused.
+    let lz4 = ArrowFbTable([ArrowFbScalar(1, 8), ArrowFbRef(ArrowFbStructs(words([1, 0]), 16)),
+                            ArrowFbRef(ArrowFbStructs(words([0, 0, 0, 8]), 16)), ArrowFbRef(ArrowFbTable([ArrowFbScalar(1, 1)]))])
+    let compressed = framed(message(4, 3, ArrowFbRef(lz4), 8), bytes.zeros(8))
+    match arrowipc.read_header(compressed, 0, false)
+        Ok(h)  =>
+            test.assert(arrowipc.compression_of(compressed, h) == Ok("ZSTD"))
+            test.assert_eq(arrowfault.kind_of(refused(arrowipc.read_batch(compressed, h, s, []))),
+                ArrowUnsupported)
+        Err(e) => test.fail(e.message())
+    match feed_all(bytes.concat([schema,
+        framed(message(4, 3, ArrowFbRef(batch_table(1, [1, 0], [0, 0, 0, 8])), 8), bytes.zeros(8))]))
+        Ok(step) =>
+            test.assert_eq(list.len(step.events), 2)
+            match step.events[1]
+                ArrowBatchSeen(b, at, len) =>
+                    let h = arrowipc.read_header(bytes.concat([schema, bytes.zeros(0)]), 0, false)
+                    test.assert_eq(len, 8)
+                    test.assert(at > 0)
+                    test.assert_eq(b.rows, 1)
+                _                          => test.fail("expected a batch")
+        Err(e)   => test.fail(e.message())
+
+@test
+fn test_a_dictionary_batch_needs_its_field_and_its_data()
+    let s = arrowtype.schema([arrowtype.dict_field("d", ArrowUtf8, ArrowInt8, 5, false, true)])
+    let schema = schema_bytes(s)
+    let no_data = framed(message(4, 2, ArrowFbRef(ArrowFbTable([ArrowFbScalar(5, 8)])), 0), bytes.zeros(0))
+    test.assert_eq(arrowfault.kind_of(refused(feed_all(bytes.concat([schema, no_data])))), ArrowIncomplete)
+    let data = batch_table(0, [0, 0], [0, 0, 0, 0, 0, 0])
+    let wrong_id = framed(message(4, 2, ArrowFbRef(ArrowFbTable([ArrowFbScalar(9, 8), ArrowFbRef(data)])), 0),
+        bytes.zeros(0))
+    test.assert_eq(arrowfault.kind_of(refused(feed_all(bytes.concat([schema, wrong_id])))), ArrowCorrupt)
+    let good = framed(message(4,
+        2,
+        ArrowFbRef(ArrowFbTable([ArrowFbScalar(5, 8), ArrowFbRef(data), ArrowFbScalar(1, 1)])),
+        0),
+                      bytes.zeros(0))
+    match arrowipc.read_header(good, 0, false)
+        Ok(h)  => test.assert(arrowipc.compression_of(good, h) == Ok(""))
+        Err(e) => test.fail(e.message())
+    let batch = framed(message(4, 3, ArrowFbRef(batch_table(0, [0, 0], [0, 0, 0, 0])), 0), bytes.zeros(0))
+    test.assert_eq(arrowfault.kind_of(refused(feed_all(bytes.concat([schema, batch])))), ArrowCorrupt)
+    match feed_all(bytes.concat([schema, good, batch, eos()]))
+        Ok(step) => test.assert_eq(list.len(step.events), 4)
+        Err(e)   => test.fail(e.message())
+
+// ── the schema, both ways ───────────────────────────────────────────
+
+@test
+fn test_a_schema_of_every_type_writes_and_reads_back_equal()
+    var fields: [ArrowField] = []
+    for t in [ArrowNull, ArrowBool, ArrowInt8, ArrowUInt16, ArrowInt32, ArrowUInt64, ArrowFloat16, ArrowFloat32,
+              ArrowFloat64, ArrowUtf8, ArrowLargeUtf8, ArrowBinary, ArrowLargeBinary, ArrowFixedSizeBinary(3),
+              ArrowDecimal128(10, 2), ArrowDecimal256(40, 3), ArrowDate32, ArrowDate64, ArrowTime32(ArrowMilli),
+              ArrowTime64(ArrowMicro), ArrowTimestamp(ArrowNano, "Europe/Oslo"), ArrowTimestamp(ArrowSecond, ""),
+              ArrowInterval(ArrowYearMonth), ArrowInterval(ArrowDayTime), ArrowInterval(ArrowMonthDayNano),
+              ArrowDuration(ArrowMilli)]
+        list.push(fields, arrowtype.field("f${list.len(fields)}", t, true))
+    let item = arrowtype.field("item", ArrowInt32, true)
+    list.push(fields, arrowtype.nested_field("l", ArrowList, true, [item]))
+    list.push(fields, arrowtype.nested_field("ll", ArrowLargeList, true, [item]))
+    list.push(fields, arrowtype.nested_field("fl", ArrowFixedSizeList(2), true, [item]))
+    list.push(fields, arrowtype.nested_field("st", ArrowStruct, true, [item]))
+    list.push(fields,
+        arrowtype.nested_field("m", ArrowMap(true), true, [arrowtype.map_entries(ArrowUtf8, ArrowInt32, true)]))
+    list.push(fields, arrowtype.nested_field("su", ArrowUnion(ArrowSparseUnion), true, [item]))
+    list.push(fields, arrowtype.nested_field("du", ArrowUnion(ArrowDenseUnion), true, [item]))
+    list.push(fields, arrowtype.dict_field("d", ArrowUtf8, ArrowUInt32, 1, true, true))
+    var tagged = arrowtype.field("meta", ArrowInt8, false)
+    tagged = ArrowField { name: tagged.name, data_type: tagged.data_type, nullable: false, children: [], dictionary: None,
+                          type_ids: [], metadata: [ArrowKeyValue { key: "unit", value: "kg" }] }
+    list.push(fields, tagged)
+    let s = arrowtype.schema_with(fields, [ArrowKeyValue { key: "origin", value: "test" }], ArrowLittle)
+    let src = schema_bytes(s)
+    match arrowipc.read_header(src, 0, false)
+        Ok(h)  =>
+            match arrowipc.read_schema(src, h)
+                Ok(back) =>
+                    test.assert_eq(list.len(back.fields), list.len(s.fields))
+                    for k in 0..list.len(s.fields)
+                        test.assert(arrowtype.field_eq(back.fields[k], s.fields[k]))
+                    test.assert(back.metadata == s.metadata)
+                Err(e)   => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+// A schema message holding one field of this type code and type table.
+fn one_type(code: Int, table: ArrowFbObject) -> Bytes
+    let field = ArrowFbTable([ArrowFbRef(ArrowFbString("x")), ArrowFbScalar(1, 1), ArrowFbScalar(code, 1), ArrowFbRef(table),
+                              ArrowFbAbsent, ArrowFbRef(ArrowFbTables([]))])
+    let schema = ArrowFbTable([ArrowFbScalar(0, 2), ArrowFbRef(ArrowFbTables([field]))])
+    framed(message(4, 1, ArrowFbRef(schema), 0), bytes.zeros(0))
+
+@test
+fn test_the_types_this_package_does_not_read_are_named()
+    let cases = [one_type(22, ArrowFbTable([])), one_type(23, ArrowFbTable([])), one_type(24, ArrowFbTable([])),
+                 one_type(25, ArrowFbTable([])), one_type(26, ArrowFbTable([])), one_type(99, ArrowFbTable([])),
+                 one_type(2, ArrowFbTable([ArrowFbScalar(12, 4), ArrowFbScalar(1, 1)]))]
+    let kinds = [ArrowUnsupported, ArrowUnsupported, ArrowUnsupported, ArrowUnsupported, ArrowUnsupported, ArrowCorrupt,
+                 ArrowCorrupt]
+    for k in 0..list.len(cases)
+        let f = refused(feed_all(cases[k]))
+        test.assert_eq(arrowfault.kind_of(f), kinds[k])
+        test.assert_eq(arrowfault.where_of(f).path, "x")
+    // A union with no type ids takes 0 to n - 1.
+    let child = ArrowFbTable([ArrowFbRef(ArrowFbString("c")), ArrowFbScalar(1, 1), ArrowFbScalar(6, 1),
+                              ArrowFbRef(ArrowFbTable([])), ArrowFbAbsent, ArrowFbRef(ArrowFbTables([]))])
+    let u = ArrowFbTable([ArrowFbRef(ArrowFbString("u")), ArrowFbScalar(1, 1), ArrowFbScalar(14, 1),
+                          ArrowFbRef(ArrowFbTable([ArrowFbScalar(0, 2)])), ArrowFbAbsent, ArrowFbRef(ArrowFbTables([child, child]))])
+    let schema = ArrowFbTable([ArrowFbScalar(0, 2), ArrowFbRef(ArrowFbTables([u]))])
+    match feed_all(framed(message(4, 1, ArrowFbRef(schema), 0), bytes.zeros(0)))
+        Ok(step) =>
+            match step.events[0]
+                ArrowSchemaSeen(s) => test.assert_eq(s.fields[0].type_ids, [0, 1])
+                _                  => test.fail("expected the schema")
+        Err(e)   => test.fail(e.message())
+
+// ── FlatBuffers ─────────────────────────────────────────────────────
+
+@test
+fn test_the_flatbuffers_vectors_and_their_refusals()
+    let root = ArrowFbTable([ArrowFbRef(ArrowFbStrings(["ab", "c"])), ArrowFbRef(ArrowFbInts([-1, 7], 8)),
+                             ArrowFbRef(ArrowFbString("hi"))])
+    let meta = meta_of(root)
+    match arrowfb.root_table(meta)
+        Ok(t)  =>
+            test.assert(arrowfb.vector_str_at(meta, t, 0, 1) == Ok("c"))
+            test.assert(arrowfb.vector_int_at(meta, t, 1, 0, 8) == Ok(-1))
+            test.assert(arrowfb.field_str(meta, t, 2) == Ok("hi"))
+            test.assert_eq(refused(arrowfb.vector_int_at(meta, t, 1, 2, 8)),
+                ArrowIndexOutOfRange(2, 2, arrowfault.nowhere()))
+            test.assert(arrowfb.field_str(meta, t, 5) == Ok(""))
+        Err(e) => test.fail(e.message())
+    // A string whose length runs past the buffer.
+    let short = bytes.from_byte_list([8, 0, 0, 0, 6, 0, 8, 0, 4, 0, 0, 0, 4, 0, 0, 0, 90, 0, 0, 0])
+    match arrowfb.root_table(short)
+        Ok(t)  => test.assert_eq(refused(arrowfb.field_str(short, t, 0)),
+            ArrowShortMetadata(110, 20, arrowfault.at_byte(-1, 16)))
+        Err(e) => test.fail(e.message())
+    let prefixed = bytes.concat([le32(bytes.len(meta)), meta])
+    match arrowfb.root_table_size_prefixed(prefixed)
+        Ok(t)  => test.assert(arrowfb.field_str(prefixed, t, 2) == Ok("hi"))
+        Err(e) => test.fail(e.message())
+    test.assert_eq(refused(arrowfb.encode(arrowfb.builder(8), root)),
+        ArrowWriteBufferTooSmall(bytes.len(meta), 8, arrowfault.nowhere()))
+    test.assert_eq(arrowfb.metadata_bound(1, 2, 3), 128 + 16 + 32 + 24)
+
+// ── the writer ──────────────────────────────────────────────────────
+
+fn int_batch() -> ArrowBatch
+    arrowcol.batch(one_int_schema(),
+        [arrowcol.array(ArrowInt64, 2, 1, [arrowbuf.buffer(0, 1), arrowbuf.buffer(8, 16)])],
+        2)
+
+fn int_body() -> Bytes
+    bytes.from_byte_list([1, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+
+@test
+fn test_the_writer_refuses_what_it_cannot_describe()
+    let w = arrowwrite.writer(ArrowStreamFormat, one_int_schema())
+    var c = bytes.cursor_le(bytes.zeros(4096))
+    match arrowwrite.write_schema(w, c)
+        Ok(pair) =>
+            let (w2, _) = pair
+            test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_schema(w2, c))), ArrowCorrupt)
+        Err(e)   => test.fail(e.message())
+    match arrowcol.slice_batch(int_batch(), 1, 1)
+        Ok(b)  =>
+            test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch(w, b, int_body(), c))),
+                ArrowUnsupported)
+            test.assert(arrowwrite.metadata_bound(b) > 0)
+        Err(e) => test.fail(e.message())
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch(w, int_batch(), bytes.zeros(4), c))),
+        ArrowIncomplete)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch_parts(w, int_batch(), [], c))), ArrowCorrupt)
+    let bad = ArrowDictEntry { id: 1, values: arrowcol.array(ArrowInt8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(8, 1)]),
+                               body: bytes.zeros(2) }
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_dictionary(w, bad, false, c))), ArrowIncomplete)
+    var full = bytes.cursor_le(bytes.zeros(2))
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_schema(w, full))), ArrowUnsupported)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.finish(w, full))), ArrowUnsupported)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.finish(arrowwrite.writer(ArrowFileFormat, one_int_schema()), full))),
+                   ArrowUnsupported)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_prologue(arrowwrite.writer(ArrowFileFormat, one_int_schema()), full))),
+                   ArrowUnsupported)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_offsets32([1, -1], c))), ArrowCorrupt)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_offsets32([2000000000, 2000000000], c))),
+        ArrowCorrupt)
+    test.assert_eq(arrowwrite.footer_bound(one_int_schema(), 2, 0) > arrowwrite.footer_bound(one_int_schema(), 0, 0),
+        true)
+
+// The float writer narrows by rounding to nearest, ties to even.
+@test
+fn test_floats_narrow_to_half_and_single_precision()
+    let values = [1.0,
+        65504.0,
+        100000.0,
+        0.000000059604644775390625,
+        0.00000001,
+        1.0 / 0.0,
+        0.0 / 0.0,
+        -0.0,
+        2049.0,
+        2051.0]
+    var c = bytes.cursor_le(bytes.zeros(64))
+    match arrowwrite.write_floats(values, 16, c)
+        Ok(n)  => test.assert_eq(n, 24)
+        Err(e) => test.fail(e.message())
+    let out = c.finish()
+    let got = arrowbuf.buffer(0, 20)
+    let want = [1.0, 65504.0, 1.0 / 0.0, 0.000000059604644775390625, 0.0, 1.0 / 0.0]
+    for k in 0..list.len(want)
+        test.assert(arrowbuf.float_at(out, got, k, 2) == Ok(want[k]))
+    match arrowbuf.float_at(out, got, 6, 2)
+        Ok(v)  => test.assert(v != v)
+        Err(e) => test.fail(e.message())
+    // 2049 lies between 2048 and 2050 and goes to the even 2048; 2051
+    // goes to 2052.
+    test.assert(arrowbuf.float_at(out, got, 8, 2) == Ok(2048.0))
+    test.assert(arrowbuf.float_at(out, got, 9, 2) == Ok(2052.0))
+    var d = bytes.cursor_le(bytes.zeros(16))
+    match arrowwrite.write_floats([0.1], 32, d)
+        Ok(_)  => test.assert(arrowbuf.float_at(d.finish(), arrowbuf.buffer(0, 4), 0, 4) == Ok(0.100000001490116119384765625))
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_whole_stream_goes_to_a_sink_and_back_from_a_source()
+    let values = arrowcol.array(ArrowUtf8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8), arrowbuf.buffer(8, 1)])
+    let dict_body = bytes.from_byte_list([0, 0, 0, 0, 1, 0, 0, 0, 122])
+    let entry = ArrowDictEntry { id: 4, values: values, body: dict_body }
+    let s = arrowtype.schema([arrowtype.field("n", ArrowInt64, true),
+        arrowtype.dict_field("d", ArrowUtf8, ArrowInt8, 4, false, true)])
+    let idx = arrowcol.dict_array(ArrowInt8, 2, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(24, 2)], 4)
+    let n = arrowcol.array(ArrowInt64, 2, 1, [arrowbuf.buffer(0, 1), arrowbuf.buffer(8, 16)])
+    let b = arrowcol.batch_with_dicts(s, [n, idx], 2, [entry])
+    let body = bytes.concat([int_body(), bytes.from_byte_list([0, 0])])
+    for mode in [ArrowStreamFormat, ArrowFileFormat]
+        let sink = Buffer.new()
+        match arrowwrite.write_all(mode, s, [b, b], [body, body], sink)
+            Ok(written) =>
+                let out = bytes.from_byte_list(list.map(sink.to_bytes(), x => x as Int))
+                test.assert_eq(bytes.len(out), written)
+                match arrowipc.read_all(Buffer.from_bytes(sink.to_bytes()), mode)
+                    Ok(events) => test.assert_eq(list.len(events), 5)
+                    Err(e)     => test.fail(e.message())
+            Err(e)      => test.fail(e.message())
+        sink.drop()
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_all(ArrowStreamFormat, s, [b], [], Buffer.new()))),
+        ArrowCorrupt)
+    test.assert_eq(arrowfault.kind_of(refused(arrowipc.read_all(Buffer.from_str("junk"), ArrowStreamFormat))),
+        ArrowCorrupt)
+
+// ── the data frame traits ───────────────────────────────────────────
+
+// A sink that writes down what it was given.
+struct Log
+    lines: [Str]
+
+impl ArrowColumnSink for Log
+    fn put_floats(self, name: Str, values: [Float], present: [Bool]) -> Self
+        Log { lines: list.concat(self.lines, ["${name} floats ${values} ${present}"]) }
+
+    fn put_ints(self, name: Str, values: [Int], present: [Bool]) -> Self
+        Log { lines: list.concat(self.lines, ["${name} ints ${values} ${present}"]) }
+
+    fn put_bools(self, name: Str, values: [Bool], present: [Bool]) -> Self
+        Log { lines: list.concat(self.lines, ["${name} bools ${values} ${present}"]) }
+
+    fn put_strs(self, name: Str, values: [Str], present: [Bool]) -> Self
+        Log { lines: list.concat(self.lines, ["${name} strs ${values} ${present}"]) }
+
+    fn skip_column(self, name: Str, reason: Str) -> Self
+        Log { lines: list.concat(self.lines, ["${name} skipped"]) }
+
+// A source of four columns, one of each kind, three rows.
+struct Rows
+    kinds: [ArrowCellKind]
+
+impl ArrowColumnSource for Rows
+    fn column_count(self) -> Int
+        list.len(self.kinds)
+
+    fn row_count(self) -> Int
+        3
+
+    fn column_name(self, i: Int) -> Str
+        "c${i}"
+
+    fn column_kind(self, i: Int) -> ArrowCellKind
+        self.kinds[i]
+
+    fn column_present(self, i: Int) -> [Bool]
+        [true, false, true]
+
+    fn floats_at(self, i: Int) -> [Float]
+        [1.5, 0.0, 2.5]
+
+    fn ints_at(self, i: Int) -> [Int]
+        [1, 0, -3]
+
+    fn bools_at(self, i: Int) -> [Bool]
+        [true, false, true]
+
+    fn strs_at(self, i: Int) -> [Str]
+        ["a", "", "ccc"]
+
+@test
+fn test_a_source_becomes_a_batch_and_drains_into_a_sink()
+    let src = Rows { kinds: [ArrowCellFloat, ArrowCellInt, ArrowCellBool, ArrowCellStr] }
+    match arrowdf.schema_of_source(src)
+        Ok(s)  => test.assert_eq(arrowtype.field_paths(s), ["c0", "c1", "c2", "c3"])
+        Err(e) => test.fail(e.message())
+    match arrowdf.body_bound_of_source(src)
+        Ok(n)  =>
+            var c = bytes.cursor_le(bytes.zeros(n))
+            match arrowdf.batch_of_source(src, c)
+                Ok(pair) =>
+                    let (b, used) = pair
+                    test.assert_eq(used, n)
+                    let body = c.finish()
+                    test.assert(arrowcol.batch_ok(body, b))
+                    match arrowdf.drain_batch(body, b, Log { lines: [] })
+                        Ok(log) =>
+                            test.assert_eq(log.lines, ["c0 floats [1.5, 0, 2.5] [true, false, true]",
+                                                       "c1 ints [1, 0, -3] [true, false, true]",
+                                                       "c2 bools [true, false, true] [true, false, true]",
+                                                       "c3 strs [a, , ccc] [true, false, true]"])
+                        Err(e)  => test.fail(e.message())
+                    match arrowdf.drain_projection(body, b, ["c3"], Log { lines: [] })
+                        Ok(log) => test.assert_eq(list.len(log.lines), 1)
+                        Err(e)  => test.fail(e.message())
+                Err(e)   => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    var small = bytes.cursor_le(bytes.zeros(8))
+    test.assert_eq(arrowfault.kind_of(refused(arrowdf.batch_of_source(src, small))), ArrowUnsupported)
+    var room = bytes.cursor_le(bytes.zeros(4096))
+    test.assert_eq(arrowfault.kind_of(refused(arrowdf.batch_of_source_slice(src, 2, 5, room))), ArrowCorrupt)
+    let odd = Rows { kinds: [ArrowCellUnsupported] }
+    test.assert_eq(arrowfault.kind_of(refused(arrowdf.schema_of_source(odd))), ArrowCorrupt)
+    test.assert_eq(arrowfault.kind_of(refused(arrowdf.body_bound_of_source(odd))), ArrowCorrupt)
+
+@test
+fn test_the_narrowings_and_the_columns_a_frame_cannot_hold()
+    test.assert(arrowdf.cell_kind_of(ArrowFloat16) == ArrowCellFloat)
+    test.assert(arrowdf.cell_kind_of(ArrowLargeUtf8) == ArrowCellStr)
+    test.assert(arrowdf.cell_kind_of(ArrowDate64) == ArrowCellInt)
+    test.assert(arrowdf.cell_kind_of(ArrowInterval(ArrowDayTime)) == ArrowCellUnsupported)
+    test.assert(arrowdf.cell_kind_of(ArrowNull) == ArrowCellUnsupported)
+    test.assert(arrowdf.cell_kind_of(ArrowFixedSizeBinary(4)) == ArrowCellUnsupported)
+    test.assert(arrowdf.cell_kind_of(ArrowBinary) == ArrowCellUnsupported)
+    test.assert(arrowdf.narrowing_of(ArrowDecimal256(40, 2)) == ArrowNarrowPrecisionLost)
+    test.assert(arrowdf.narrowing_of(ArrowStruct) == ArrowNarrowRefused)
+    var names: [Str] = []
+    for n in [ArrowNarrowExact, ArrowNarrowSignLost, ArrowNarrowPrecisionLost, ArrowNarrowRangeLost, ArrowNarrowExpanded,
+              ArrowNarrowRefused]
+        test.assert(not list.contains(names, arrowdf.narrowing_name(n)))
+        list.push(names, arrowdf.narrowing_name(n))
+    let s = arrowtype.schema([arrowtype.field("u", ArrowUInt64, true), arrowtype.dict_field("d", ArrowUtf8, ArrowInt8, 1, false, true),
+                              arrowtype.field("x", ArrowInt32, true)])
+    test.assert_eq(arrowdf.lossy_columns(s), ["u: sign lost", "d: expanded"])
+
+// A batch of a decimal, a dictionary of strings, a UInt64, a bool and a
+// struct, drained.
+@test
+fn test_draining_resolves_dictionaries_scales_decimals_and_skips_the_rest()
+    // Decimal128(5, 2) 12345 is 123.45; the dictionary holds "p", "q".
+    var body_list: [Int] = []
+    for k in 0..16
+        list.push(body_list, (if k == 0 then 57 else (if k == 1 then 48 else 0)))
+    list.append(body_list, [1, 0, 0, 0, 0, 0, 0, 0])
+    list.append(body_list, [255, 255, 255, 255, 255, 255, 255, 255])
+    list.append(body_list, [1, 0, 0, 0, 0, 0, 0, 0])
+    let body = bytes.from_byte_list(body_list)
+    let dict_body = bytes.from_byte_list([0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 112, 113])
+    let values = arrowcol.array(ArrowUtf8, 2, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 12), arrowbuf.buffer(12, 2)])
+    let s = arrowtype.schema([arrowtype.field("dec", ArrowDecimal128(5, 2), true), arrowtype.dict_field("d", ArrowUtf8, ArrowInt8, 2, false, true),
+                              arrowtype.field("u", ArrowUInt64, true), arrowtype.field("b", ArrowBool, true),
+                              arrowtype.nested_field("st", ArrowStruct, true, [])])
+    let cols = [arrowcol.array(ArrowDecimal128(5, 2), 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 16)]),
+                arrowcol.dict_array(ArrowInt8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(16, 1)], 2),
+                arrowcol.array(ArrowUInt64, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(24, 8)]),
+                arrowcol.array(ArrowBool, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(32, 1)]),
+                arrowcol.nested_array(ArrowStruct, 1, 0, [arrowbuf.no_buffer()], [])]
+    let b = arrowcol.batch_with_dicts(s, cols, 1, [ArrowDictEntry { id: 2, values: values, body: dict_body }])
+    match arrowdf.drain_batch(body, b, Log { lines: [] })
+        Ok(log) =>
+            test.assert_eq(log.lines, ["dec floats [123.45] [true]", "d strs [q] [true]", "u ints [-1] [true]",
+                                       "b bools [true] [true]", "st skipped"])
+        Err(e)  => test.fail(e.message())
+    let missing = arrowcol.batch(s, cols, 1)
+    test.assert_eq(arrowfault.kind_of(refused(arrowdf.drain_column(body, missing, "d", Log { lines: [] }))),
+        ArrowCorrupt)
+    let past = arrowcol.batch_with_dicts(s, cols, 1, [ArrowDictEntry { id: 2,
+        values: arrowcol.array(ArrowUtf8, 1, 0, values.buffers),
+        body: dict_body }])
+    test.assert_eq(arrowfault.kind_of(refused(arrowdf.drain_column(body, past, "d", Log { lines: [] }))),
+        ArrowCorrupt)
+    test.assert_eq(arrowfault.kind_of(refused(arrowdf.drain_column(body, b, "nope", Log { lines: [] }))),
+        ArrowCorrupt)
+
+@test
+fn test_the_last_corners_of_the_reader()
+    let s = one_int_schema()
+    let schema = schema_bytes(s)
+    match feed_all(schema)
+        Ok(step) => test.assert(arrowipc.schema_of(step.reader) == Ok(s))
+        Err(e)   => test.fail(e.message())
+    let sparse_tensor = framed(message(4, 5, ArrowFbRef(ArrowFbTable([])), 0), bytes.zeros(0))
+    match arrowipc.read_header(sparse_tensor, 0, false)
+        Ok(h)  => test.assert_eq(refused(arrowipc.read_batch(sparse_tensor, h, s, [])),
+                                 ArrowUnexpectedMessage("tensor", "record batch", arrowfault.at_byte(-1, 8)))
+        Err(e) => test.fail(e.message())
+    match arrowipc.read_header(eos(), 0, false)
+        Ok(h)  => test.assert_eq(refused(arrowipc.read_schema(eos(), h)),
+                                 ArrowUnexpectedMessage("end of stream", "schema", arrowfault.at_byte(-1, 8)))
+        Err(e) => test.fail(e.message())
+    let dict_first = framed(message(4, 2, ArrowFbRef(ArrowFbTable([])), 0), bytes.zeros(0))
+    test.assert_eq(refused(feed_all(dict_first)),
+        ArrowUnexpectedMessage("dictionary batch", "schema", arrowfault.at_byte(0, 8)))
+    test.assert_eq(refused(arrowipc.read_header(bytes.from_byte_list([0, 0, 0, 128]), 0, true)),
+                   ArrowNegativeLength(-2147483648, arrowfault.at_byte(-1, 0)))
+    // Two columns whose buffers are next to each other come back as one
+    // range; a name the schema does not have is refused.
+    let two = arrowtype.schema([arrowtype.field("a", ArrowInt64, true), arrowtype.field("b", ArrowInt64, true)])
+    let cols = [arrowcol.array(ArrowInt64, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8)]),
+                arrowcol.array(ArrowInt64, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(8, 8)])]
+    let b = arrowcol.batch(two, cols, 1)
+    var c = bytes.cursor_le(bytes.zeros(arrowwrite.message_bound(b)))
+    match arrowwrite.write_batch(arrowwrite.writer(ArrowStreamFormat, two), b, bytes.zeros(16), c)
+        Ok(_)  =>
+            let out = c.finish()
+            match arrowipc.read_header(out, 0, false)
+                Ok(h)  =>
+                    test.assert(arrowipc.ranges_for(out, h, two, ["b", "a"]) == Ok([arrowbuf.buffer(0, 16)]))
+                    test.assert_eq(arrowfault.kind_of(refused(arrowipc.ranges_for(out, h, two, ["z"]))),
+                        ArrowCorrupt)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    // A column whose validity bitmap is too short for its length: the
+    // null count cannot be counted, so the bound falls back to the
+    // arithmetic one.
+    let loose = arrowcol.array(ArrowInt64, 20, -1, [arrowbuf.buffer(0, 1), arrowbuf.buffer(8, 160)])
+    let bad = arrowcol.batch(one_int_schema(), [loose], 20)
+    test.assert_eq(arrowwrite.metadata_bound(bad), 8 + arrowfb.metadata_bound(1, 2, 1))
+
+@test
+fn test_the_last_corners_of_the_arrays_and_the_frame()
+    let body = bytes.from_byte_list([214, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                                     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255])
+    let wide = arrowcol.array(ArrowDecimal256(40, 1), 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 32)])
+    test.assert(arrowcol.decimal_bytes_at(body, wide, 0) == Ok(arrowbuf.buffer(0, 32)))
+    let f32 = arrowcol.array(ArrowFloat32, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 4)])
+    let s = arrowtype.schema([arrowtype.field("w", ArrowDecimal256(40, 1), true), arrowtype.field("f", ArrowFloat32, true)])
+    match arrowdf.drain_batch(body, arrowcol.batch(s, [wide, f32], 1), Log { lines: [] })
+        Ok(log) => test.assert_eq(log.lines[0], "w floats [-4.2] [true]")
+        Err(e)  => test.fail(e.message())
+    let values = arrowcol.array(ArrowInt8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 1)])
+    let idx = arrowcol.dict_array(ArrowInt8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 1)], 6)
+    let d = arrowcol.batch_with_dicts(s, [], 0, [ArrowDictEntry { id: 6, values: values, body: body }])
+    match arrowcol.dictionary_for(d, idx)
+        Ok(e)  => test.assert_eq(e.id, 6)
+        Err(e) => test.fail(e.message())
+    let raw = bytes.from_byte_list([0, 0, 0, 0, 3, 0, 0, 0, 226, 130, 40])
+    let text = arrowcol.array(ArrowUtf8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8), arrowbuf.buffer(8, 3)])
+    test.assert_eq(arrowfault.kind_of(refused(arrowcol.str_at(raw, text, 0))), ArrowCorrupt)
+    test.assert_eq(arrowtime.zone_of(ArrowInt8), "")
+    test.assert_eq(arrowtype.check_type(ArrowTime64(ArrowMilli)),
+                   [ArrowTypeInvalid("a time64 in milliseconds", arrowfault.nowhere())])
+    let nested = arrowtype.schema([arrowtype.nested_field("l", ArrowList, true, [arrowtype.field("i", ArrowInt8, true)])])
+    test.assert(arrowtype.schema_compatible(nested, nested))

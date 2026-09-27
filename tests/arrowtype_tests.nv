@@ -1,17 +1,10 @@
 // arrowtype_tests.nv — the two tables the columnar specification is,
 // asserted one type at a time.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: arrow-nv.<module>.<fn>`.
-//
-// THE CASES ARE THE ENTRIES A HAND-WRITTEN READER GETS WRONG.  A suite
-// that asserted `Int64` has two buffers would prove nothing: everybody
-// gets `Int64` right.  What follows is `Null` (no buffers at all),
-// `Bool` (bits, not bytes), `Struct` (validity only — no values
-// buffer), `FixedSizeList` (no offsets — the width is in the type) and
-// both unions (no VALIDITY — a union's nulls live in its children).
-// Those six are the whole difference between a reader that works on
-// somebody else's file and one that works on its own.
+// The cases are the entries a hand-written reader gets wrong: `Null`
+// (no buffers), `Bool` (bits, not bytes), `Struct` (validity only),
+// `FixedSizeList` (no offsets; the width is in the type) and both unions
+// (no validity bitmap; a union's nulls are in its children).
 
 use std.test
 use std.list
@@ -23,7 +16,7 @@ fn test_the_buffer_count_table_is_the_columnar_specification() [io]
     test.case("Null has no buffers at all — a length and nothing else")
     test.assert(arrowtype.buffer_count_of(ArrowNull) == 0)
 
-    test.case("Bool has validity and a BITMAP of values, which is still two")
+    test.case("Bool has validity and a bitmap of values, which is still two")
     test.assert(arrowtype.buffer_count_of(ArrowBool) == 2)
 
     test.case("a fixed-width primitive has validity and values")
@@ -37,7 +30,7 @@ fn test_the_buffer_count_table_is_the_columnar_specification() [io]
     test.assert(arrowtype.buffer_count_of(ArrowBinary) == 3)
     test.assert(arrowtype.buffer_count_of(ArrowLargeUtf8) == 3)
 
-    test.case("a list has validity and offsets and NO values — the values are the child")
+    test.case("a list has validity and offsets and no values — the values are the child")
     test.assert(arrowtype.buffer_count_of(ArrowList) == 2)
     test.assert(arrowtype.buffer_count_of(ArrowLargeList) == 2)
     test.assert(arrowtype.buffer_count_of(ArrowMap(false)) == 2)
@@ -48,7 +41,7 @@ fn test_the_buffer_count_table_is_the_columnar_specification() [io]
     test.case("a struct has validity only")
     test.assert(arrowtype.buffer_count_of(ArrowStruct) == 1)
 
-    test.case("a sparse union has type ids and NO validity")
+    test.case("a sparse union has type ids and no validity")
     test.assert(arrowtype.buffer_count_of(ArrowUnion(ArrowSparseUnion)) == 1)
 
     test.case("a dense union adds the per-element offset into its child")
@@ -89,7 +82,7 @@ fn test_the_role_of_each_buffer_is_a_function_of_the_type() [io]
         ArrowOffset64Role => test.assert(true)
         _                 => test.assert(false)
 
-    test.case("Bool's second buffer is BITS, not VALUES — the name says which")
+    test.case("Bool's second buffer is bits, not values — the name says which")
     let b = arrowbuf.layout_of(ArrowBool)
     match b[1]
         ArrowBitsRole => test.assert(true)
@@ -119,7 +112,7 @@ fn test_the_child_count_table() [io]
     test.assert(arrowtype.child_count_of(ArrowLargeList) == 1)
     test.assert(arrowtype.child_count_of(ArrowFixedSizeList(4)) == 1)
 
-    test.case("a map has ONE child too — the entries struct, not two")
+    test.case("a map has one child too — the entries struct, not two")
     test.assert(arrowtype.child_count_of(ArrowMap(false)) == 1)
 
     test.case("a struct and both unions have any number, spelled -1")
@@ -128,7 +121,7 @@ fn test_the_child_count_table() [io]
 
 @test
 fn test_the_width_of_a_bool_is_one_bit_and_that_is_why_it_is_in_bits() [io]
-    test.case("Bool is one BIT")
+    test.case("Bool is one bit")
     test.assert(arrowtype.fixed_width_bits(ArrowBool) == 1)
 
     test.case("the integers are their names")
@@ -148,7 +141,7 @@ fn test_the_width_of_a_bool_is_one_bit_and_that_is_why_it_is_in_bits() [io]
     test.assert(arrowtype.fixed_width_bits(ArrowDecimal128(38, 10)) == 128)
     test.assert(arrowtype.fixed_width_bits(ArrowDecimal256(76, 20)) == 256)
 
-    test.case("FixedSizeBinary is its width in BYTES, answered in bits")
+    test.case("FixedSizeBinary is its width in bytes, answered in bits")
     test.assert(arrowtype.fixed_width_bits(ArrowFixedSizeBinary(16)) == 128)
 
     test.case("a variable-width type answers zero")
@@ -200,7 +193,7 @@ fn test_a_time32_in_microseconds_is_refused_by_the_type_check() [io]
 fn test_a_dictionary_is_a_property_of_the_field_not_of_the_type() [io]
     let f = arrowtype.dict_field("city", ArrowUtf8, ArrowInt32, 7, false, true)
 
-    test.case("the field's data type is the VALUES' type")
+    test.case("the field's data type is the values' type")
     test.assert(arrowtype.type_eq(f.data_type, ArrowUtf8))
 
     test.case("and the index type is on the dictionary")
@@ -243,7 +236,7 @@ fn test_duplicate_field_names_are_reported_because_every_consumer_breaks_on_them
     test.assert(list.len(arrowtype.check_schema(s)) > 0)
     test.assert(arrowtype.schema_ok(s) == false)
 
-    test.case("and field_index answers the FIRST, which is the reason to check")
+    test.case("and field_index answers the first, which is the reason to check")
     test.assert(arrowtype.field_index(s, "id") == 0)
 
     test.case("a name that is not there answers -1 rather than a fault")

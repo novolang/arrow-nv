@@ -1,0 +1,439 @@
+// edges_tests.nv — the tables over every type, every fault's message,
+// the temporal conversions, and each refusal of the array accessors.
+//
+// The API suites state the rules on the cases a hand-written reader
+// gets wrong, and the golden suite reads Arrow's own files.  This suite
+// reaches what both leave out.
+
+use std.test
+use std.bytes
+use std.list
+use std.str
+use civil
+use arrowfault
+use arrowtype
+use arrowbuf
+use arrowtime
+use arrowcol
+
+fn every_type() -> [ArrowType]
+    [ArrowNull, ArrowBool, ArrowInt8, ArrowInt16, ArrowInt32, ArrowInt64, ArrowUInt8, ArrowUInt16, ArrowUInt32,
+     ArrowUInt64, ArrowFloat16, ArrowFloat32, ArrowFloat64, ArrowUtf8, ArrowLargeUtf8, ArrowBinary, ArrowLargeBinary,
+     ArrowFixedSizeBinary(4), ArrowDecimal128(10, 2), ArrowDecimal256(40, 2), ArrowDate32, ArrowDate64,
+     ArrowTime32(ArrowSecond), ArrowTime64(ArrowNano), ArrowTimestamp(ArrowMilli, "UTC"),
+     ArrowInterval(ArrowYearMonth), ArrowInterval(ArrowDayTime), ArrowInterval(ArrowMonthDayNano),
+     ArrowDuration(ArrowMicro), ArrowList, ArrowLargeList, ArrowFixedSizeList(2), ArrowStruct, ArrowMap(true),
+     ArrowUnion(ArrowSparseUnion), ArrowUnion(ArrowDenseUnion)]
+
+// The columnar specification's tables, one row per type: buffers,
+// children, bits, names.
+@test
+fn test_the_tables_over_every_type()
+    let buffers = [0,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        3,
+        3,
+        3,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        2,
+        1,
+        2]
+    let children = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, -1, 1, -1,
+                    -1]
+    let bits = [0, 1, 8, 16, 32, 64, 8, 16, 32, 64, 16, 32, 64, 0, 0, 0, 0, 32, 128, 256, 32, 64, 32, 64, 64, 32, 64, 128, 64,
+                0, 0, 0, 0, 0, 0, 0]
+    let names = ["null", "bool", "int", "int", "int", "int", "int", "int", "int", "int", "floatingpoint", "floatingpoint",
+                 "floatingpoint", "utf8", "largeutf8", "binary", "largebinary", "fixedsizebinary", "decimal", "decimal",
+                 "date", "date", "time", "time", "timestamp", "interval", "interval", "interval", "duration", "list",
+                 "largelist", "fixedsizelist", "struct", "map", "union", "union"]
+    let types = every_type()
+    for k in 0..list.len(types)
+        let t = types[k]
+        test.assert_eq(arrowtype.buffer_count_of(t), buffers[k])
+        test.assert_eq(list.len(arrowbuf.layout_of(t)), buffers[k])
+        test.assert_eq(arrowtype.child_count_of(t), children[k])
+        test.assert_eq(arrowtype.fixed_width_bits(t), bits[k])
+        test.assert_eq(arrowtype.type_name(t), names[k])
+        test.assert_eq(arrowtype.is_index_type(t), k >= 2 and k <= 9)
+        test.assert_eq(arrowtype.has_large_offsets(t),
+            t == ArrowLargeUtf8 or t == ArrowLargeBinary or t == ArrowLargeList)
+    let roles = [ArrowValidityRole, ArrowOffset32Role, ArrowOffset64Role, ArrowValuesRole, ArrowBitsRole, ArrowTypeIdRole,
+                 ArrowUnionOffsetRole]
+    var seen: [Str] = []
+    for r in roles
+        test.assert(not list.contains(seen, arrowbuf.role_name(r)))
+        list.push(seen, arrowbuf.role_name(r))
+    match arrowbuf.role_at(ArrowUtf8, 1)
+        Ok(r)  => test.assert(r == ArrowOffset32Role)
+        Err(e) => test.fail(e.message())
+    test.assert_eq(refused(arrowbuf.role_at(ArrowNull, 0)), ArrowIndexOutOfRange(0, 0, arrowfault.nowhere()))
+
+fn refused<T>(r: Result<T, ArrowFault>) -> ArrowFault
+    match r
+        Ok(_)  =>
+            test.fail("a refusal was expected")
+            ArrowBadMagic(arrowfault.nowhere())
+        Err(f) => f
+
+@test
+fn test_fields_schemas_and_their_checks()
+    let a = arrowtype.field("a", ArrowInt64, false)
+    let s = arrowtype.schema([a])
+    test.assert_eq(refused(arrowtype.field_at(s, 3)), ArrowIndexOutOfRange(3, 1, arrowfault.nowhere()))
+    match arrowtype.field_at(s, 0)
+        Ok(f)  => test.assert(arrowtype.field_eq(f, a))
+        Err(e) => test.fail(e.message())
+    test.assert(not arrowtype.field_eq(a, arrowtype.field("b", ArrowInt64, false)))
+    test.assert(not arrowtype.field_eq(arrowtype.nested_field("l", ArrowList, true, [a]),
+                                       arrowtype.nested_field("l", ArrowList, true, [a, a])))
+    test.assert(not arrowtype.field_eq(arrowtype.nested_field("l", ArrowList, true, [a]),
+                                       arrowtype.nested_field("l", ArrowList, true, [arrowtype.field("b", ArrowInt64, false)])))
+    test.assert(not arrowtype.field_eq(arrowtype.dict_field("d", ArrowUtf8, ArrowInt8, 1, false, true),
+                                       arrowtype.dict_field("d", ArrowUtf8, ArrowInt8, 2, false, true)))
+    let kv = [ArrowKeyValue { key: "k", value: "v" }]
+    test.assert(arrowtype.schema_compatible(s, arrowtype.schema_with([a], kv, ArrowLittle)))
+    test.assert(not arrowtype.schema_compatible(s, arrowtype.schema_with([a], kv, ArrowBig)))
+    test.assert(not arrowtype.schema_compatible(s, arrowtype.schema([a, a])))
+    test.assert(not arrowtype.schema_compatible(s, arrowtype.schema([arrowtype.field("a", ArrowInt32, false)])))
+    let twice = arrowtype.schema_with([a], [ArrowKeyValue { key: "k", value: "1" }, ArrowKeyValue { key: "k", value: "2" }],
+                                      ArrowLittle)
+    test.assert_eq(list.len(arrowtype.check_schema(twice)), 1)
+    let u = arrowtype.nested_field("u", ArrowUnion(ArrowSparseUnion), true, [a, a])
+    test.assert_eq(u.type_ids, [0, 1])
+    let odd = ArrowField { name: "u", data_type: ArrowUnion(ArrowDenseUnion), nullable: true, children: [a, a],
+                           dictionary: None, type_ids: [5], metadata: [] }
+    test.assert_eq(arrowtype.check_field(odd), [ArrowChildCountWrong(1, 2, arrowfault.at_field("u"))])
+    let bad_index = arrowtype.dict_field("d", ArrowUtf8, ArrowUtf8, 1, false, true)
+    test.assert_eq(list.len(arrowtype.check_field(bad_index)), 1)
+    let dupes = arrowtype.nested_field("s", ArrowStruct, true, [a, a])
+    test.assert_eq(arrowtype.check_field(dupes), [ArrowDuplicateName("a", arrowfault.at_field("s"))])
+    let loose = arrowtype.nested_field("m", ArrowMap(false), true,
+                                       [arrowtype.nested_field("entries", ArrowStruct, true,
+                                                               [arrowtype.field("key", ArrowUtf8, false), a])])
+    test.assert_eq(list.len(arrowtype.check_field(loose)), 1)
+    let deep = arrowtype.nested_field("l", ArrowList, true, [arrowtype.field("t", ArrowTime32(ArrowNano), true)])
+    test.assert_eq(list.len(arrowtype.check_field(deep)), 1)
+    test.assert_eq(list.len(arrowtype.check_type(ArrowDecimal256(80, 2))), 1)
+    test.assert_eq(list.len(arrowtype.check_type(ArrowFixedSizeList(0))), 1)
+    test.assert_eq(list.len(arrowtype.check_type(ArrowTime32(ArrowMilli))), 0)
+
+@test
+fn test_every_fault_has_a_message_a_kind_and_a_place()
+    let w = arrowfault.at_buffer(2, "a.b", 3, 40)
+    let all = [ArrowShortBody(8, 4, w), ArrowShortMetadata(8, 4, w), ArrowBadContinuation(7, w), ArrowBadMagic(w),
+               ArrowFooterNotFound(w), ArrowVersionUnsupported(3, w), ArrowEndianMismatch(w), ArrowUnknownType(99, w),
+               ArrowTypeUnsupported("RunEndEncoded", w), ArrowChildCountWrong(1, 2, w), ArrowBufferCountWrong(3, 2, w),
+               ArrowNodeCountWrong(3, 2, w), ArrowOffsetsNotAscending(2, 5, 3, w), ArrowOffsetPastEnd(2, 9, 8, w),
+               ArrowNegativeLength(-1, w), ArrowIndexOutOfRange(9, 3, w), ArrowDictionaryMissing(4, w),
+               ArrowDictionaryTypeWrong(4, w), ArrowDictionaryIndexOutOfRange(9, 3, w), ArrowUnionTypeIdUnknown(7, w),
+               ArrowDecimalOutOfRange(40, 2, w), ArrowNotUtf8(1, w), ArrowBadFixedWidth(0, w), ArrowDuplicateName("a", w),
+               ArrowUnexpectedMessage("schema", "record batch", w), ArrowMessageTooLarge(9, 8, w),
+               ArrowWriteBufferTooSmall(9, 8, w), ArrowLayoutMismatch(2, 1, w), ArrowTypeInvalid("a time32 in nanoseconds", w),
+               ArrowMisaligned(3, w), ArrowLengthMismatch(4, 3, w), ArrowWrongType("an integer column", "utf8", w)]
+    var seen: [Str] = []
+    for f in all
+        test.assert(str.ends_with(f.message(), "(message 2, a.b, buffer 3, byte 40)"))
+        test.assert(not list.contains(seen, f.message()))
+        list.push(seen, f.message())
+        let moved = arrowfault.in_message(arrowfault.under(f, "root"), 5, 100)
+        test.assert_eq(arrowfault.where_of(moved).path, "root.a.b")
+        test.assert_eq(arrowfault.where_of(moved).message, 5)
+        test.assert_eq(arrowfault.where_of(moved).at, 140)
+    test.assert_eq(arrowfault.kind_name(arrowfault.kind_of(all[5])), "unsupported")
+    test.assert_eq(arrowfault.kind_name(arrowfault.kind_of(all[1])), "incomplete")
+    test.assert_eq(ArrowBadMagic(arrowfault.nowhere()).message(), "arrow: the ARROW1 magic is missing")
+    test.assert_eq(arrowfault.where_of(arrowfault.in_message(ArrowBadMagic(arrowfault.nowhere()), 1, 100)).at, -1)
+    test.assert_eq(arrowfault.where_of(arrowfault.under(ArrowBadMagic(arrowfault.nowhere()), "x")).path, "x")
+
+// ── buffers ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_buffer_arithmetic_refuses_and_rounds()
+    let body = bytes.from_byte_list([1, 0, 0, 0, 5, 0, 0, 0, 3, 0, 0, 0])
+    test.assert_eq(arrowbuf.check_alignment([arrowbuf.buffer(0, 8), arrowbuf.buffer(12, 4)]),
+                   [ArrowMisaligned(12, arrowfault.at_buffer(-1, "", 1, 12))])
+    test.assert(not arrowbuf.bit_at(body, arrowbuf.buffer(0, 1), 9))
+    test.assert_eq(arrowbuf.with_bit(0, 3, true), 8)
+    test.assert_eq(arrowbuf.with_bit(255, 3, false), 247)
+    let offsets = arrowbuf.buffer(0, 12)
+    test.assert_eq(refused(arrowbuf.value_span(body, offsets, 1, false)),
+                   ArrowOffsetsNotAscending(2, 5, 3, arrowfault.nowhere()))
+    test.assert_eq(arrowbuf.check_offsets(body, offsets, 4, 2, 0, false),
+                   [ArrowOffsetPastEnd(1, 5, 4, arrowfault.nowhere()),
+        ArrowOffsetsNotAscending(2, 5, 3, arrowfault.nowhere())])
+    test.assert_eq(list.len(arrowbuf.check_offsets(body, offsets, 8, 5, 0, false)), 2)
+    test.assert_eq(refused(arrowbuf.element_span(arrowbuf.buffer(0, 1), 9, 1)),
+        ArrowIndexOutOfRange(9, 8, arrowfault.nowhere()))
+    test.assert_eq(refused(arrowbuf.element_span(arrowbuf.buffer(0, 8), 2, 32)),
+        ArrowIndexOutOfRange(2, 2, arrowfault.nowhere()))
+    test.assert_eq(refused(arrowbuf.uint_at(body, arrowbuf.buffer(8, 8), 1, 4)),
+                   ArrowShortBody(16, 12, arrowfault.at_byte(-1, 12)))
+    test.assert(arrowbuf.fits(body, arrowbuf.buffer(0, 12)))
+    test.assert(not arrowbuf.fits(body, arrowbuf.buffer(-1, 2)))
+
+@test
+fn test_half_and_single_floats_widen_exactly()
+    // 1.0, -2.0, the smallest subnormal, zero, infinity and a NaN, as
+    // binary16; then 1.5 as binary32.
+    let halves = bytes.from_byte_list([0, 60, 0, 192, 1, 0, 0, 0, 0, 124, 0, 126, 0, 0, 192, 63])
+    let h = arrowbuf.buffer(0, 12)
+    test.assert(arrowbuf.float_at(halves, h, 0, 2) == Ok(1.0))
+    test.assert(arrowbuf.float_at(halves, h, 1, 2) == Ok(-2.0))
+    test.assert(arrowbuf.float_at(halves, h, 2, 2) == Ok(0.000000059604644775390625))
+    test.assert(arrowbuf.float_at(halves, h, 3, 2) == Ok(0.0))
+    test.assert(arrowbuf.float_at(halves, h, 4, 2) == Ok(1.0 / 0.0))
+    match arrowbuf.float_at(halves, h, 5, 2)
+        Ok(v)  => test.assert(v != v)
+        Err(e) => test.fail(e.message())
+    test.assert(arrowbuf.float_at(halves, arrowbuf.buffer(12, 4), 0, 4) == Ok(1.5))
+    let a = arrowcol.array(ArrowFloat16, 2, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 4)])
+    test.assert(arrowcol.float_at(halves, a, 1) == Ok(-2.0))
+
+// ── time ────────────────────────────────────────────────────────────
+
+@test
+fn test_the_temporal_conversions()
+    test.assert_eq(arrowtime.unit_name(ArrowSecond), "SECOND")
+    test.assert_eq(arrowtime.unit_name(ArrowMilli), "MILLISECOND")
+    test.assert_eq(arrowtime.unit_name(ArrowMicro), "MICROSECOND")
+    test.assert_eq(arrowtime.unit_name(ArrowNano), "NANOSECOND")
+    test.assert_eq(arrowtime.convert(-1500, ArrowMilli, ArrowSecond), -2)
+    test.assert_eq(refused(arrowtime.date32_to_civil(3000000000)),
+        ArrowIndexOutOfRange(3000000000, 2147483648, arrowfault.nowhere()))
+    match civil.date(2026, 9, 27)
+        Ok(d)  =>
+            test.assert(arrowtime.civil_to_date64(d) == Ok(20723 * 86400000))
+            match arrowtime.civil_to_date64(d)
+                Ok(ms) => test.assert(arrowtime.date64_to_civil(ms) == Ok(d))
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+    test.assert_eq(refused(arrowtime.civil_to_date32(civil.date_from_epoch_day(3000000000))),
+                   ArrowIndexOutOfRange(3000000000, 2147483648, arrowfault.nowhere()))
+    match arrowtime.time_to_civil(3723, ArrowSecond)
+        Ok(t)  =>
+            test.assert_eq(t.hour, 1)
+            test.assert_eq(t.minute, 2)
+            test.assert_eq(t.second, 3)
+            test.assert(arrowtime.civil_to_time(t, ArrowMilli) == Ok(3723000))
+        Err(e) => test.fail(e.message())
+    test.assert_eq(refused(arrowtime.time_to_civil(86400, ArrowSecond)),
+        ArrowIndexOutOfRange(86400, 86400, arrowfault.nowhere()))
+    match arrowtime.timestamp_to_civil(-1, ArrowSecond)
+        Ok(dt) =>
+            test.assert_eq(dt.date.year, 1969)
+            test.assert_eq(dt.time.second, 59)
+            test.assert(arrowtime.civil_to_timestamp(dt, ArrowMicro) == Ok(-1000000))
+        Err(e) => test.fail(e.message())
+    test.assert_eq(arrowfault.kind_of(refused(arrowtime.civil_to_timestamp(civil.datetime(civil.date_from_epoch_day(200000),
+                                                                                           civil.midnight()),
+                                                                                           ArrowNano))),
+                   ArrowCorrupt)
+    test.assert(arrowtime.unit_of(ArrowTime32(ArrowMilli)) == Ok(ArrowMilli))
+    test.assert(arrowtime.unit_of(ArrowTime64(ArrowNano)) == Ok(ArrowNano))
+    test.assert(arrowtime.unit_of(ArrowTimestamp(ArrowMicro, "")) == Ok(ArrowMicro))
+    test.assert(arrowtime.unit_of(ArrowDuration(ArrowSecond)) == Ok(ArrowSecond))
+    test.assert(not arrowtime.is_wall_clock(ArrowDate32))
+    match arrowtime.duration_to_delta(-1500, ArrowMilli)
+        Ok(d)  =>
+            test.assert_eq(d.secs, -2)
+            test.assert_eq(d.nanos, 500000000)
+        Err(e) => test.fail(e.message())
+    test.assert_eq(arrowtime.interval_parts(1, 2, 3), (1, 2, 3))
+    test.assert_eq(arrowtime.interval_width(ArrowYearMonth), 4)
+    test.assert_eq(arrowtime.interval_width(ArrowDayTime), 8)
+    test.assert_eq(arrowtime.interval_width(ArrowMonthDayNano), 16)
+    test.assert_eq(arrowtime.interval_unit_name(ArrowYearMonth), "YEAR_MONTH")
+    test.assert_eq(arrowtime.interval_unit_name(ArrowDayTime), "DAY_TIME")
+    test.assert_eq(arrowtime.interval_unit_name(ArrowMonthDayNano), "MONTH_DAY_NANO")
+
+// ── arrays ──────────────────────────────────────────────────────────
+
+// An Int32 column [7, null, 9] over one body: a validity byte, padding,
+// then three values.
+fn ints_body() -> Bytes
+    bytes.from_byte_list([5, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0])
+
+fn ints_col() -> ArrowArray
+    arrowcol.array(ArrowInt32, 3, 1, [arrowbuf.buffer(0, 1), arrowbuf.buffer(8, 12)])
+
+@test
+fn test_the_accessors_refuse_the_wrong_column_kind()
+    let body = ints_body()
+    let a = ints_col()
+    test.assert_eq(refused(arrowcol.float_at(body, a, 0)),
+        ArrowWrongType("a floating-point column", "int", arrowfault.nowhere()))
+    test.assert_eq(refused(arrowcol.bool_at(body, a, 0)),
+        ArrowWrongType("a bool column", "int", arrowfault.nowhere()))
+    test.assert_eq(refused(arrowcol.span_at(body, a, 0)),
+        ArrowWrongType("a string or binary column", "int", arrowfault.nowhere()))
+    test.assert_eq(refused(arrowcol.decimal_bytes_at(body, a, 0)),
+        ArrowWrongType("a decimal column", "int", arrowfault.nowhere()))
+    test.assert_eq(refused(arrowcol.child_range(body, a, 0)),
+        ArrowWrongType("a list or map column", "int", arrowfault.nowhere()))
+    test.assert_eq(refused(arrowcol.struct_field(a, 0)),
+        ArrowWrongType("a struct column", "int", arrowfault.nowhere()))
+    test.assert_eq(refused(arrowcol.map_at(body, a, 0)),
+        ArrowWrongType("a map column", "int", arrowfault.nowhere()))
+    test.assert_eq(refused(arrowcol.date_at(body, a, 0)),
+        ArrowWrongType("a date column", "int", arrowfault.nowhere()))
+    test.assert_eq(refused(arrowcol.union_at(body, a, arrowtype.field("a", ArrowInt32, true), 0)),
+                   ArrowWrongType("a union column", "int", arrowfault.nowhere()))
+    let s = arrowcol.array(ArrowUtf8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8), arrowbuf.buffer(8, 4)])
+    test.assert_eq(refused(arrowcol.int_at(body, s, 0)),
+        ArrowWrongType("an integer column", "utf8", arrowfault.nowhere()))
+    test.assert_eq(refused(arrowcol.is_valid(body, a, 3)), ArrowIndexOutOfRange(3, 3, arrowfault.nowhere()))
+    test.assert(arrowcol.is_null(body, a, 1) == Ok(true))
+
+@test
+fn test_slicing_counting_and_the_bodies_that_do_not_fit()
+    let body = ints_body()
+    let a = ints_col()
+    let s = arrowtype.schema([arrowtype.field("n", ArrowInt32, true)])
+    let b = arrowcol.batch(s, [a], 3)
+    test.assert_eq(refused(arrowcol.slice_batch(b, 2, 2)), ArrowIndexOutOfRange(4, 3, arrowfault.nowhere()))
+    match arrowcol.slice_batch(b, 1, 2)
+        Ok(t)  =>
+            test.assert_eq(t.rows, 2)
+            test.assert(arrowcol.int_at(body, t.columns[0], 1) == Ok(9))
+            test.assert(arrowcol.recount_nulls(body, t.columns[0]) == Ok(1))
+        Err(e) => test.fail(e.message())
+    test.assert(arrowcol.recount_nulls(body, arrowcol.array(ArrowNull, 4, 4, [])) == Ok(4))
+    let u = arrowcol.nested_array(ArrowUnion(ArrowSparseUnion), 1, 0, [arrowbuf.buffer(0, 1)], [])
+    test.assert(arrowcol.recount_nulls(body, u) == Ok(0))
+    test.assert(arrowcol.is_valid(body, u, 0) == Ok(true))
+    test.assert(arrowcol.recount_nulls(body, arrowcol.array(ArrowInt32, 3, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(8, 12)])) == Ok(0))
+    let wide = arrowcol.array(ArrowInt32, 20, -1, [arrowbuf.buffer(0, 1), arrowbuf.buffer(8, 12)])
+    test.assert_eq(refused(arrowcol.recount_nulls(body, wide)), ArrowShortBody(3, 1, arrowfault.at_byte(-1, 0)))
+    test.assert(arrowcol.is_valid(body, arrowcol.array(ArrowNull, 2, 2, []), 0) == Ok(false))
+
+@test
+fn test_strings_bools_decimals_and_dates()
+    // "ab", then a byte that is not UTF-8, then an offset past the values.
+    let body = bytes.from_byte_list([0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 9, 0, 0, 0, 97, 98, 255, 0, 5, 0, 0, 0, 0, 0, 0, 0])
+    let s = arrowcol.array(ArrowUtf8, 3, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 16), arrowbuf.buffer(16, 4)])
+    test.assert(arrowcol.str_at(body, s, 0) == Ok("ab"))
+    test.assert_eq(refused(arrowcol.str_at(body, s, 1)), ArrowNotUtf8(1, arrowfault.at_byte(-1, 18)))
+    test.assert_eq(refused(arrowcol.span_at(body, s, 2)), ArrowOffsetPastEnd(3, 9, 4, arrowfault.nowhere()))
+    let far = arrowcol.array(ArrowUtf8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8), arrowbuf.buffer(27, 4)])
+    test.assert_eq(refused(arrowcol.str_at(body, far, 0)), ArrowShortBody(29, 28, arrowfault.at_byte(-1, 27)))
+    let bits = arrowcol.array(ArrowBool, 3, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(18, 1)])
+    test.assert(arrowcol.int_at(body, bits, 0) == Ok(1))
+    let dec = arrowcol.array(ArrowDecimal128(10, 2), 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 16)])
+    test.assert(arrowcol.decimal_bytes_at(body, dec, 0) == Ok(arrowbuf.buffer(0, 16)))
+    let dec256 = arrowcol.array(ArrowDecimal256(40, 2), 0, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 0)])
+    test.assert_eq(refused(arrowcol.decimal_bytes_at(body, dec256, 0)),
+        ArrowIndexOutOfRange(0, 0, arrowfault.nowhere()))
+    let d32 = arrowcol.array(ArrowDate32, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(20, 4)])
+    match arrowcol.date_at(body, d32, 0)
+        Ok(d)  => test.assert_eq(d.day, 6)
+        Err(e) => test.fail(e.message())
+    let d64 = arrowcol.array(ArrowDate64, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(20, 8)])
+    match arrowcol.date_at(body, d64, 0)
+        Ok(d)  => test.assert_eq(d.year, 1970)
+        Err(e) => test.fail(e.message())
+    // Two, three and four byte sequences, and the ways each goes wrong.
+    for good in ["c3a9", "e282ac", "f09f9880", "ed9fbf", "f48fbfbf"]
+        test.assert(utf8_ok(good))
+    for bad in ["c3", "e0808f", "eda080", "f4908080", "c328", "f8"]
+        test.assert(not utf8_ok(bad))
+
+fn utf8_ok(h: Str) -> Bool
+    let raw = bytes.from_hex(h) ?? bytes.zeros(0)
+    let n = bytes.len(raw)
+    let body = bytes.concat([bytes.from_byte_list([0, 0, 0, 0, n, 0, 0, 0]), raw])
+    let a = arrowcol.array(ArrowUtf8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8), arrowbuf.buffer(8, n)])
+    match arrowcol.str_at(body, a, 0)
+        Ok(_)  => true
+        Err(_) => false
+
+@test
+fn test_nested_accessors_refuse_what_is_not_there()
+    let body = bytes.from_byte_list([0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 2])
+    let child = arrowcol.array(ArrowInt8, 2, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(16, 2)])
+    let large = arrowcol.nested_array(ArrowLargeList, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 16)], [child])
+    test.assert(arrowcol.child_range(body, large, 0) == Ok((0, 2)))
+    let empty = arrowcol.nested_array(ArrowList, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8)], [])
+    test.assert_eq(refused(arrowcol.list_at(body, empty, 0)), ArrowChildCountWrong(1, 0, arrowfault.nowhere()))
+    let st = arrowcol.nested_array(ArrowStruct, 2, 0, [arrowbuf.no_buffer()], [child])
+    test.assert_eq(refused(arrowcol.struct_field(st, 1)), ArrowIndexOutOfRange(1, 1, arrowfault.nowhere()))
+    let sparse = arrowcol.nested_array(ArrowUnion(ArrowSparseUnion), 2, 0, [arrowbuf.buffer(16, 2)], [child, child])
+    let f = arrowtype.nested_field("u", ArrowUnion(ArrowSparseUnion), true, [arrowtype.field("a", ArrowInt8, true)])
+    test.assert_eq(refused(arrowcol.union_at(body, sparse, f, 1)),
+        ArrowUnionTypeIdUnknown(2, arrowfault.at_field("u")))
+
+@test
+fn test_dictionaries_resolve_across_a_delta_and_refuse_past_it()
+    // Values: a first dictionary ["x"], a delta ["y"]; indices 0, 1, 2.
+    let values_body = bytes.from_byte_list([0, 0, 0, 0, 1, 0, 0, 0, 120, 121])
+    let first = arrowcol.array(ArrowUtf8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8), arrowbuf.buffer(8, 1)])
+    let delta = arrowcol.array(ArrowUtf8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 8), arrowbuf.buffer(9, 1)])
+    var dicts = arrowcol.install_dictionary([], ArrowDictEntry { id: 3, values: first, body: values_body }, false)
+    dicts = arrowcol.install_dictionary(dicts, ArrowDictEntry { id: 3, values: delta, body: values_body }, true)
+    test.assert_eq(list.len(dicts), 2)
+    let body = bytes.from_byte_list([0, 1, 2])
+    let idx = arrowcol.dict_array(ArrowInt8, 3, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 3)], 3)
+    let s = arrowtype.schema([arrowtype.dict_field("d", ArrowUtf8, ArrowInt8, 3, false, true)])
+    let b = arrowcol.batch_with_dicts(s, [idx], 3, dicts)
+    test.assert(arrowcol.dict_str_at(body, b, idx, 0) == Ok("x"))
+    test.assert(arrowcol.dict_str_at(body, b, idx, 1) == Ok("y"))
+    test.assert(arrowcol.dict_span_at(body, b, idx, 1) == Ok(arrowbuf.buffer(9, 1)))
+    test.assert_eq(refused(arrowcol.dict_span_at(body, b, idx, 2)),
+        ArrowDictionaryIndexOutOfRange(2, 2, arrowfault.nowhere()))
+    let none = arrowcol.batch(s, [idx], 3)
+    test.assert_eq(refused(arrowcol.dictionary_for(none, idx)), ArrowDictionaryMissing(3, arrowfault.nowhere()))
+    test.assert_eq(refused(arrowcol.dict_str_at(body, none, idx, 0)),
+        ArrowDictionaryMissing(3, arrowfault.nowhere()))
+    test.assert_eq(arrowcol.validate_batch(body, none), [ArrowDictionaryMissing(3, arrowfault.at_field("d"))])
+
+@test
+fn test_validation_reports_each_contradiction()
+    let body = ints_body()
+    let w = arrowfault.at_field("a")
+    test.assert_eq(arrowcol.validate(body, arrowcol.array(ArrowInt32, 3, 0, []), "a"),
+        [ArrowLayoutMismatch(2, 0, w)])
+    test.assert_eq(arrowcol.validate(body, arrowcol.array(ArrowInt32, -1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(8, 12)]), "a"),
+                   [ArrowNegativeLength(-1, w)])
+    test.assert_eq(arrowcol.validate(body, arrowcol.array(ArrowInt32, 3, 4, [arrowbuf.no_buffer(), arrowbuf.buffer(8, 12)]), "a"),
+                   [ArrowIndexOutOfRange(4, 3, w)])
+    let list_no_child = arrowcol.array(ArrowList, 0, 0, [arrowbuf.no_buffer(), arrowbuf.no_buffer()])
+    test.assert_eq(arrowcol.validate(body, list_no_child, "a"), [ArrowChildCountWrong(1, 0, w)])
+    let short_child = arrowcol.array(ArrowInt32, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(8, 4)])
+    let st = arrowcol.nested_array(ArrowStruct, 3, 0, [arrowbuf.no_buffer()], [short_child])
+    test.assert_eq(arrowcol.validate(body, st, "a"), [ArrowLengthMismatch(3, 1, arrowfault.at_field("a.0"))])
+    // Offsets that go backwards, found by the walk over a column.
+    let back = bytes.from_byte_list([0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 97, 98, 99])
+    let text = arrowcol.array(ArrowUtf8, 2, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(0, 12), arrowbuf.buffer(12, 3)])
+    test.assert_eq(arrowcol.validate(back, text, "t"),
+        [ArrowOffsetsNotAscending(2, 3, 1, arrowfault.at_field("t"))])
+    let s = arrowtype.schema([arrowtype.field("a", ArrowInt32, true), arrowtype.field("b", ArrowUtf8, true)])
+    test.assert_eq(arrowcol.validate_batch(body, arrowcol.batch(s, [ints_col()], 3)),
+        [ArrowNodeCountWrong(2, 1, arrowfault.nowhere())])
+    let wrong = arrowtype.schema([arrowtype.field("a", ArrowInt64, true)])
+    test.assert_eq(list.len(arrowcol.validate_batch(body, arrowcol.batch(wrong, [ints_col()], 3))), 1)
