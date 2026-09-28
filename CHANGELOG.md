@@ -5,13 +5,17 @@ All notable changes to arrow-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## 0.1.0 — 2026-09-27
+## 0.1.0 — 2026-09-28
 
 The first implementation of the interface published as 0.0.1: the
 schema and its checks, arrays and batches over spans, the temporal
 conversions, the FlatBuffers subset read and written, the IPC reader
 for the stream and file forms, the writer, and the data frame traits.
-It requires novo 0.13.0 and calendar-nv `^0.2.0`.
+It requires novo 0.14.0 and calendar-nv `^0.2.0`.
+
+Tests cover `arrowipc.read_all` over a source that fails or ends with
+`IoClosed`, and `arrowwrite.write_all` into a sink that fails or accepts
+no bytes.
 
 ### Breaking changes
 

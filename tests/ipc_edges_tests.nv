@@ -456,6 +456,60 @@ fn test_a_whole_stream_goes_to_a_sink_and_back_from_a_source()
         ArrowCorrupt)
     test.assert_eq(arrowfault.kind_of(refused(arrowipc.read_all(Buffer.from_str("junk"), ArrowStreamFormat))),
         ArrowCorrupt)
+    test.assert_eq(refused(arrowipc.read_all(Failing { code: 0 }, ArrowStreamFormat)),
+        ArrowShortBody(1, 0, arrowfault.at_byte(-1, 0)))
+    // A source that ends its stream with `IoClosed` is read as one that
+    // answers no bytes: both are an empty stream.
+    test.assert_eq(events_read(arrowipc.read_all(Closed { code: 0 }, ArrowStreamFormat)),
+        events_read(arrowipc.read_all(Buffer.from_str(""), ArrowStreamFormat)))
+    test.assert_eq(refused(arrowwrite.write_all(ArrowStreamFormat, s, [b], [body], Full { code: 0 })),
+        ArrowWriteBufferTooSmall(written_len(s, b, body), 0, arrowfault.at_byte(-1, 0)))
+    test.assert_eq(refused(arrowwrite.write_all(ArrowStreamFormat, s, [b], [body], Failing { code: 0 })),
+        ArrowWriteBufferTooSmall(written_len(s, b, body), 0, arrowfault.at_byte(-1, 0)))
+
+// How many events a whole read answered, or -1 when it refused.
+fn events_read(r: Result<[ArrowIpcEvent], ArrowFault>) -> Int
+    match r
+        Ok(events) => list.len(events)
+        Err(_)     => -1
+
+// How many bytes the stream of one batch takes, measured through an
+// in-memory sink.
+fn written_len(s: ArrowSchema, b: ArrowBatch, body: Bytes) -> Int
+    let sink = Buffer.new()
+    let n = match arrowwrite.write_all(ArrowStreamFormat, s, [b], [body], sink)
+        Ok(k)  => k
+        Err(_) => -1
+    sink.drop()
+    n
+
+// A source and a sink whose stream fails on every call.
+struct Failing
+    code: Int
+
+impl Read[] for Failing
+    fn read(self, n: Int) -> Result<Bytes, IoError> []
+        Err(IoNotFound)
+
+impl Write[] for Failing
+    fn write(self, data: Bytes) -> Result<Int, IoError> []
+        Err(IoNotFound)
+
+// A source whose stream has ended.
+struct Closed
+    code: Int
+
+impl Read[] for Closed
+    fn read(self, n: Int) -> Result<Bytes, IoError> []
+        Err(IoClosed)
+
+// A sink that accepts no bytes.
+struct Full
+    code: Int
+
+impl Write[] for Full
+    fn write(self, data: Bytes) -> Result<Int, IoError> []
+        Ok(0)
 
 // ── the data frame traits ───────────────────────────────────────────
 
