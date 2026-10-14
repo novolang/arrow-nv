@@ -1,0 +1,101 @@
+// hostile_tests.nv — buffer spans and offsets that a producer chose to
+// make as large as an Int allows.
+//
+// The batch metadata and an offsets buffer both carry 64-bit values, so
+// a sum of two of them can leave an Int; each case below is refused with
+// a fault instead of an overflow.
+
+use std.test
+use std.bytes
+use std.list
+use arrowtype
+use arrowbuf
+use arrowfb
+use arrowipc
+
+fn le32(v: Int) -> Bytes
+    bytes.from_byte_list([v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255])
+
+fn words(values: [Int]) -> Bytes
+    var out: [Int] = []
+    for v in values
+        for k in 0..8
+            list.push(out, (v >> (8 * k)) & 255)
+    bytes.from_byte_list(out)
+
+fn meta_of(root: ArrowFbObject) -> Bytes
+    match arrowfb.encode(arrowfb.builder(1048576), root)
+        Ok(pair) =>
+            let (_, meta) = pair
+            meta
+        Err(e)   =>
+            test.fail(e.message())
+            bytes.zeros(0)
+
+fn one_int_schema() -> ArrowSchema
+    arrowtype.schema([arrowtype.field("n", ArrowInt64, true)])
+
+// A record batch of one Int64 column whose two buffer entries are given.
+fn batch_with(buffers: [Int]) -> Bytes
+    let table = ArrowFbTable([ArrowFbScalar(1, 8),
+        ArrowFbRef(ArrowFbStructs(words([1, 0]), 16)),
+        ArrowFbRef(ArrowFbStructs(words(buffers), 16))])
+    let root = ArrowFbTable([ArrowFbScalar(4, 2), ArrowFbScalar(3, 1), ArrowFbRef(table), ArrowFbScalar(8, 8)])
+    let meta = meta_of(root)
+    bytes.concat([bytes.from_byte_list([255, 255, 255, 255]), le32(bytes.len(meta)), meta, bytes.zeros(8)])
+
+fn read_refused(buffers: [Int]) -> Bool
+    let msg = batch_with(buffers)
+    match arrowipc.read_header(msg, 0, false)
+        Err(_) => true
+        Ok(h)  =>
+            match arrowipc.read_batch(msg, h, one_int_schema(), [])
+                Err(_) => true
+                Ok(_)  => false
+
+@test
+fn test_a_buffer_entry_whose_sum_leaves_an_int_is_refused()
+    let big = 4611686018427387904
+
+    test.case("start and length of 2^62 each")
+    test.assert(read_refused([big, big, 0, 8]))
+
+    test.case("the largest start and a length of one")
+    test.assert(read_refused([9223372036854775807, 1, 0, 8]))
+
+    test.case("a negative start and the smallest length")
+    test.assert(read_refused([-9223372036854775807 - 1, -9223372036854775807 - 1, 0, 8]))
+
+    test.case("an honest entry still reads")
+    test.assert(not read_refused([0, 0, 0, 8]))
+
+fn offsets_of(entries: [Int]) -> Bytes
+    words(entries)
+
+@test
+fn test_a_64_bit_offset_beyond_the_body_is_refused_not_added() [io]
+    let body = offsets_of([9223372036854775800, 9223372036854775807])
+    let offsets = arrowbuf.buffer(0, 16)
+
+    test.case("a first offset near the maximum")
+    match arrowbuf.value_span(body, offsets, 0, true)
+        Ok(span) => test.assert(span.start + span.len >= 0)
+        Err(_)   => test.assert(true)
+
+    test.case("a negative first offset")
+    let negative = offsets_of([-9223372036854775807 - 1, 0])
+    match arrowbuf.value_span(negative, offsets, 0, true)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_an_element_index_near_the_maximum_is_out_of_range_not_multiplied() [io]
+    test.case("a fixed-width element")
+    match arrowbuf.element_span(arrowbuf.buffer(0, 16), 4611686018427387904, 64)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a bit element")
+    match arrowbuf.element_span(arrowbuf.buffer(0, 16), 9223372036854775807, 1)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

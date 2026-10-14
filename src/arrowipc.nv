@@ -858,10 +858,17 @@ fn node(src: Bytes, h: ArrowMessageHeader, meta: Bytes, batch: ArrowFbPos, f: Ar
         if walk.buffers >= total
             return Err(ArrowBufferCountWrong(walk.buffers + 1, total, arrowfault.at_field(path)))
         let b = buffer_at(meta, batch, walk.buffers)!
-        if b.start < 0 or b.len < 0 or b.start + b.len > h.body_len
-            return Err(ArrowShortBody(b.start + b.len,
+        // Both numbers are int64s off the wire, so no sum is formed
+        // until the start is known to be inside the body.
+        let inside = b.start >= 0 and b.start <= h.body_len
+        if not inside or b.len < 0 or b.len > h.body_len - b.start
+            let want = if inside and b.len >= 0 and b.len <= h.body_len
+                b.start + b.len
+            else
+                h.body_len + 1
+            return Err(ArrowShortBody(want,
                 h.body_len,
-                arrowfault.at_buffer(-1, path, walk.buffers, h.body_at + b.start)))
+                arrowfault.at_buffer(-1, path, walk.buffers, (if inside then h.body_at + b.start else -1))))
         list.push(buffers, ArrowBuffer { start: h.body_at + b.start, len: b.len })
         walk.buffers = walk.buffers + 1
     var children: [ArrowArray] = []

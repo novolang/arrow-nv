@@ -5,6 +5,13 @@ All notable changes to arrow-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## Unreleased
+
+### Fixed
+
+- A record batch buffer entry whose start and length sum past the largest Int is refused, and an offsets buffer entry that is negative is refused, instead of overflowing.
+- An element index near the largest Int is reported as out of range instead of being multiplied by the element width.
+
 ## 0.1.0 — 2026-09-28
 
 The first implementation of the interface published as 0.0.1: the

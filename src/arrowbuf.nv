@@ -255,6 +255,10 @@ pub fn value_span(body: Bytes, offsets: ArrowBuffer, i: Int,
         4
     let first = int_at(body, offsets, i, width)!
     let next = int_at(body, offsets, i + 1, width)!
+    // A negative entry is refused so that `next - first` below, and
+    // every sum a caller forms from the span, stays inside an Int.
+    if first < 0
+        return Err(ArrowNegativeLength(first, arrowfault.nowhere()))
     if next < first
         return Err(ArrowOffsetsNotAscending(i + 1, first, next, arrowfault.nowhere()))
     Ok(ArrowBuffer { start: first, len: next - first })
@@ -298,16 +302,17 @@ pub fn element_span(values: ArrowBuffer, i: Int, bits: Int) -> Result<ArrowBuffe
         1
     else
         bits / 8
+    let count = if bits < 8
+        values.len * 8 / bits
+    else
+        values.len / size
+    // Compared as a count so that a wild `i` is never multiplied.
+    if i < 0 or i >= count
+        return Err(ArrowIndexOutOfRange(i, count, arrowfault.nowhere()))
     let at = if bits < 8
         i * bits / 8
     else
         i * size
-    if i < 0 or at + size > values.len
-        let count = if bits < 8
-            values.len * 8 / bits
-        else
-            values.len / size
-        return Err(ArrowIndexOutOfRange(i, count, arrowfault.nowhere()))
     Ok(ArrowBuffer { start: values.start + at, len: size })
 
 // A signed little-endian integer of `width` bytes at element `i`.
