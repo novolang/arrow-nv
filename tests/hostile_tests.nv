@@ -99,3 +99,8 @@ fn test_an_element_index_near_the_maximum_is_out_of_range_not_multiplied() [io]
     match arrowbuf.element_span(arrowbuf.buffer(0, 16), 9223372036854775807, 1)
         Ok(_)  => test.assert(false)
         Err(_) => test.assert(true)
+
+@test
+fn test_a_buffer_entry_that_starts_inside_and_ends_past_the_body_is_refused()
+    test.case("a start of 4 and a length of 8 in a body of 8 bytes")
+    test.assert(read_refused([4, 8, 0, 8]))

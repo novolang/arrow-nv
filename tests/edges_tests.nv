@@ -437,3 +437,9 @@ fn test_validation_reports_each_contradiction()
         [ArrowNodeCountWrong(2, 1, arrowfault.nowhere())])
     let wrong = arrowtype.schema([arrowtype.field("a", ArrowInt64, true)])
     test.assert_eq(list.len(arrowcol.validate_batch(body, arrowcol.batch(wrong, [ints_col()], 3))), 1)
+
+@test
+fn test_a_sub_byte_element_has_a_one_byte_span() [io]
+    match arrowbuf.element_span(arrowbuf.buffer(0, 2), 9, 1)
+        Ok(span) => test.assert_eq(span.len, 1)
+        Err(e)   => test.fail(e.message())
