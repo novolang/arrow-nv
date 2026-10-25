@@ -290,7 +290,7 @@ pub fn body_bound_of_source<S: ArrowColumnSource>(src: S) -> Result<Int, ArrowFa
 // buffer is live.
 pub fn batch_of_source<S: ArrowColumnSource>(src: S,
                                              var dst: Cursor) -> Result<(ArrowBatch, Int), ArrowFault>
-    batch_of_source_slice(src, 0, src.row_count(), dst)
+    batch_of_source_slice(src, 0, src.row_count(), var dst)
 
 // The rows `[from, from + count)` of a source as one batch.
 //
@@ -311,20 +311,20 @@ pub fn batch_of_source_slice<S: ArrowColumnSource>(src: S, from: Int, count: Int
     for i in 0..src.column_count()
         let present = src.column_present(i)[from:from + count]
         let validity = ArrowBuffer { start: at, len: arrowbuf.bitmap_bytes(count) }
-        at = at + arrowwrite.write_validity(present, dst)!
+        at = at + arrowwrite.write_validity(present, var dst)!
         let nulls = count_false(present)
         match src.column_kind(i)
             ArrowCellFloat =>
                 let values = ArrowBuffer { start: at, len: 8 * count }
-                at = at + arrowwrite.write_floats(src.floats_at(i)[from:from + count], 64, dst)!
+                at = at + arrowwrite.write_floats(src.floats_at(i)[from:from + count], 64, var dst)!
                 list.push(columns, arrowcol.array(ArrowFloat64, count, nulls, [validity, values]))
             ArrowCellInt   =>
                 let values = ArrowBuffer { start: at, len: 8 * count }
-                at = at + arrowwrite.write_ints(src.ints_at(i)[from:from + count], 64, dst)!
+                at = at + arrowwrite.write_ints(src.ints_at(i)[from:from + count], 64, var dst)!
                 list.push(columns, arrowcol.array(ArrowInt64, count, nulls, [validity, values]))
             ArrowCellBool  =>
                 let values = ArrowBuffer { start: at, len: arrowbuf.bitmap_bytes(count) }
-                at = at + arrowwrite.write_bits(src.bools_at(i)[from:from + count], dst)!
+                at = at + arrowwrite.write_bits(src.bools_at(i)[from:from + count], var dst)!
                 list.push(columns, arrowcol.array(ArrowBool, count, nulls, [validity, values]))
             _              =>
                 let texts = src.strs_at(i)[from:from + count]
@@ -334,12 +334,12 @@ pub fn batch_of_source_slice<S: ArrowColumnSource>(src: S, from: Int, count: Int
                     list.push(lengths, str.len(t))
                     total = total + str.len(t)
                 let offsets = ArrowBuffer { start: at, len: 4 * (count + 1) }
-                at = at + arrowwrite.write_offsets32(lengths, dst)!
+                at = at + arrowwrite.write_offsets32(lengths, var dst)!
                 let values = ArrowBuffer { start: at, len: total }
                 for t in texts
                     dst.put_bytes(bytes.from_str(t))
                 at = at + total
-                at = at + arrowwrite.write_padding(total, dst)!
+                at = at + arrowwrite.write_padding(total, var dst)!
                 list.push(columns, arrowcol.array(ArrowUtf8, count, nulls, [validity, offsets, values]))
     Ok((arrowcol.batch(s, columns, count), at))
 

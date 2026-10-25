@@ -241,9 +241,9 @@ pub enum ArrowFbObject
 pub fn encode(b: ArrowFbBuilder, root: ArrowFbObject) -> Result<(ArrowFbBuilder, Bytes), ArrowFault>
     var out: [Int] = [0, 0, 0, 0]
     var vtables: [Int] = []
-    let at = write_object(out, vtables, root)
-    patch(out, 0, 4, at)
-    pad_to(out, 8)
+    let at = write_object(var out, var vtables, root)
+    patch(var out, 0, 4, at)
+    pad_to(var out, 8)
     if list.len(out) > b.capacity
         return Err(ArrowWriteBufferTooSmall(list.len(out), b.capacity, arrowfault.nowhere()))
     Ok((ArrowFbBuilder { capacity: b.capacity, used: list.len(out), vtables: vtables },
@@ -302,43 +302,43 @@ fn patch(var out: [Int], at: Int, width: Int, v: Int)
 // Write an object and answer where a reference to it should point.
 fn write_object(var out: [Int], var vtables: [Int], v: ArrowFbObject) -> Int
     match v
-        ArrowFbTable(fields)       => write_table(out, vtables, fields)
+        ArrowFbTable(fields)       => write_table(var out, var vtables, fields)
         ArrowFbTables(items)       =>
-            pad_to(out, 4)
+            pad_to(var out, 4)
             let at = list.len(out)
-            put(out, list.len(items), 4)
+            put(var out, list.len(items), 4)
             for _ in items
-                put(out, 0, 4)
+                put(var out, 0, 4)
             for k in 0..list.len(items)
-                let target = write_object(out, vtables, items[k])
-                patch(out, at + 4 + 4 * k, 4, target - (at + 4 + 4 * k))
+                let target = write_object(var out, var vtables, items[k])
+                patch(var out, at + 4 + 4 * k, 4, target - (at + 4 + 4 * k))
             at
         ArrowFbStructs(data, size) =>
-            pad_to(out, 8)
-            put(out, 0, 4)
+            pad_to(var out, 8)
+            put(var out, 0, 4)
             let at = list.len(out)
-            put(out, bytes.len(data) / size, 4)
+            put(var out, bytes.len(data) / size, 4)
             for byte_value in bytes.to_byte_list(data)
                 list.push(out, byte_value as Int)
             at
         ArrowFbInts(values, width) =>
-            pad_to(out, 8)
+            pad_to(var out, 8)
             if width == 8
-                put(out, 0, 4)
+                put(var out, 0, 4)
             let at = list.len(out)
-            put(out, list.len(values), 4)
+            put(var out, list.len(values), 4)
             for value in values
-                put(out, value, width)
+                put(var out, value, width)
             at
         ArrowFbStrings(items)      =>
             var refs: [ArrowFbObject] = []
             for text in items
                 list.push(refs, ArrowFbString(text))
-            write_object(out, vtables, ArrowFbTables(refs))
+            write_object(var out, var vtables, ArrowFbTables(refs))
         ArrowFbString(text)        =>
-            pad_to(out, 4)
+            pad_to(var out, 4)
             let at = list.len(out)
-            put(out, str.len(text), 4)
+            put(var out, str.len(text), 4)
             for k in 0..str.len(text)
                 list.push(out, str.byte_at_or(text, k, 0))
             list.push(out, 0)
@@ -364,28 +364,28 @@ fn write_table(var out: [Int], var vtables: [Int], fields: [ArrowFbField]) -> In
             end = end + width
     let size = (end + 3) / 4 * 4
     var vtable: [Int] = []
-    put(vtable, 4 + 2 * list.len(fields), 2)
-    put(vtable, size, 2)
+    put(var vtable, 4 + 2 * list.len(fields), 2)
+    put(var vtable, size, 2)
     for o in offsets
-        put(vtable, o, 2)
+        put(var vtable, o, 2)
     var vt = shared(out, vtables, vtable)
     if vt < 0
-        pad_to(out, 2)
+        pad_to(var out, 2)
         vt = list.len(out)
         list.append(out, vtable)
         list.push(vtables, vt)
-    pad_to(out, 8)
+    pad_to(var out, 8)
     let at = list.len(out)
-    put(out, at - vt, 4)
+    put(var out, at - vt, 4)
     for _ in 4..size
         list.push(out, 0)
     for k in 0..list.len(fields)
         if let ArrowFbScalar(value, width) = fields[k]
-            patch(out, at + offsets[k], width, value)
+            patch(var out, at + offsets[k], width, value)
     for k in 0..list.len(fields)
         if let ArrowFbRef(target) = fields[k]
             let where = at + offsets[k]
-            patch(out, where, 4, write_object(out, vtables, target) - where)
+            patch(var out, where, 4, write_object(var out, var vtables, target) - where)
     at
 
 // Where a vtable with these bytes was already written, or -1.

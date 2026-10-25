@@ -63,7 +63,7 @@ fn one_int_schema() -> ArrowSchema
 
 fn schema_bytes(s: ArrowSchema) -> Bytes
     var c = bytes.cursor_le(bytes.zeros(arrowwrite.schema_message_bound(s)))
-    match arrowwrite.write_schema(arrowwrite.writer(ArrowStreamFormat, s), c)
+    match arrowwrite.write_schema(arrowwrite.writer(ArrowStreamFormat, s), var c)
         Ok(_)  => c.finish()
         Err(e) =>
             test.fail(e.message())
@@ -366,32 +366,32 @@ fn int_body() -> Bytes
 fn test_the_writer_refuses_what_it_cannot_describe()
     let w = arrowwrite.writer(ArrowStreamFormat, one_int_schema())
     var c = bytes.cursor_le(bytes.zeros(4096))
-    match arrowwrite.write_schema(w, c)
+    match arrowwrite.write_schema(w, var c)
         Ok(pair) =>
             let (w2, _) = pair
-            test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_schema(w2, c))), ArrowCorrupt)
+            test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_schema(w2, var c))), ArrowCorrupt)
         Err(e)   => test.fail(e.message())
     match arrowcol.slice_batch(int_batch(), 1, 1)
         Ok(b)  =>
-            test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch(w, b, int_body(), c))),
+            test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch(w, b, int_body(), var c))),
                 ArrowUnsupported)
             test.assert(arrowwrite.metadata_bound(b) > 0)
         Err(e) => test.fail(e.message())
-    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch(w, int_batch(), bytes.zeros(4), c))),
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch(w, int_batch(), bytes.zeros(4), var c))),
         ArrowIncomplete)
-    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch_parts(w, int_batch(), [], c))), ArrowCorrupt)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch_parts(w, int_batch(), [], var c))), ArrowCorrupt)
     let bad = ArrowDictEntry { id: 1, values: arrowcol.array(ArrowInt8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(8, 1)]),
                                body: bytes.zeros(2) }
-    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_dictionary(w, bad, false, c))), ArrowIncomplete)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_dictionary(w, bad, false, var c))), ArrowIncomplete)
     var full = bytes.cursor_le(bytes.zeros(2))
-    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_schema(w, full))), ArrowUnsupported)
-    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.finish(w, full))), ArrowUnsupported)
-    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.finish(arrowwrite.writer(ArrowFileFormat, one_int_schema()), full))),
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_schema(w, var full))), ArrowUnsupported)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.finish(w, var full))), ArrowUnsupported)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.finish(arrowwrite.writer(ArrowFileFormat, one_int_schema()), var full))),
                    ArrowUnsupported)
-    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_prologue(arrowwrite.writer(ArrowFileFormat, one_int_schema()), full))),
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_prologue(arrowwrite.writer(ArrowFileFormat, one_int_schema()), var full))),
                    ArrowUnsupported)
-    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_offsets32([1, -1], c))), ArrowCorrupt)
-    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_offsets32([2000000000, 2000000000], c))),
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_offsets32([1, -1], var c))), ArrowCorrupt)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_offsets32([2000000000, 2000000000], var c))),
         ArrowCorrupt)
     test.assert_eq(arrowwrite.footer_bound(one_int_schema(), 2, 0) > arrowwrite.footer_bound(one_int_schema(), 0, 0),
         true)
@@ -410,7 +410,7 @@ fn test_floats_narrow_to_half_and_single_precision()
         2049.0,
         2051.0]
     var c = bytes.cursor_le(bytes.zeros(64))
-    match arrowwrite.write_floats(values, 16, c)
+    match arrowwrite.write_floats(values, 16, var c)
         Ok(n)  => test.assert_eq(n, 24)
         Err(e) => test.fail(e.message())
     let out = c.finish()
@@ -426,7 +426,7 @@ fn test_floats_narrow_to_half_and_single_precision()
     test.assert(arrowbuf.float_at(out, got, 8, 2) == Ok(2048.0))
     test.assert(arrowbuf.float_at(out, got, 9, 2) == Ok(2052.0))
     var d = bytes.cursor_le(bytes.zeros(16))
-    match arrowwrite.write_floats([0.1], 32, d)
+    match arrowwrite.write_floats([0.1], 32, var d)
         Ok(_)  => test.assert(arrowbuf.float_at(d.finish(), arrowbuf.buffer(0, 4), 0, 4) == Ok(0.100000001490116119384765625))
         Err(e) => test.fail(e.message())
 
@@ -574,7 +574,7 @@ fn test_a_source_becomes_a_batch_and_drains_into_a_sink()
     match arrowdf.body_bound_of_source(src)
         Ok(n)  =>
             var c = bytes.cursor_le(bytes.zeros(n))
-            match arrowdf.batch_of_source(src, c)
+            match arrowdf.batch_of_source(src, var c)
                 Ok(pair) =>
                     let (b, used) = pair
                     test.assert_eq(used, n)
@@ -593,9 +593,9 @@ fn test_a_source_becomes_a_batch_and_drains_into_a_sink()
                 Err(e)   => test.fail(e.message())
         Err(e) => test.fail(e.message())
     var small = bytes.cursor_le(bytes.zeros(8))
-    test.assert_eq(arrowfault.kind_of(refused(arrowdf.batch_of_source(src, small))), ArrowUnsupported)
+    test.assert_eq(arrowfault.kind_of(refused(arrowdf.batch_of_source(src, var small))), ArrowUnsupported)
     var room = bytes.cursor_le(bytes.zeros(4096))
-    test.assert_eq(arrowfault.kind_of(refused(arrowdf.batch_of_source_slice(src, 2, 5, room))), ArrowCorrupt)
+    test.assert_eq(arrowfault.kind_of(refused(arrowdf.batch_of_source_slice(src, 2, 5, var room))), ArrowCorrupt)
     let odd = Rows { kinds: [ArrowCellUnsupported] }
     test.assert_eq(arrowfault.kind_of(refused(arrowdf.schema_of_source(odd))), ArrowCorrupt)
     test.assert_eq(arrowfault.kind_of(refused(arrowdf.body_bound_of_source(odd))), ArrowCorrupt)
@@ -687,7 +687,7 @@ fn test_the_last_corners_of_the_reader()
                 arrowcol.array(ArrowInt64, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(8, 8)])]
     let b = arrowcol.batch(two, cols, 1)
     var c = bytes.cursor_le(bytes.zeros(arrowwrite.message_bound(b)))
-    match arrowwrite.write_batch(arrowwrite.writer(ArrowStreamFormat, two), b, bytes.zeros(16), c)
+    match arrowwrite.write_batch(arrowwrite.writer(ArrowStreamFormat, two), b, bytes.zeros(16), var c)
         Ok(_)  =>
             let out = c.finish()
             match arrowipc.read_header(out, 0, false)

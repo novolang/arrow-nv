@@ -439,7 +439,7 @@ pub fn install_dictionary(dicts: [ArrowDictEntry], entry: ArrowDictEntry,
 pub fn flatten_nodes(b: ArrowBatch) -> [ArrowArray]
     var out: [ArrowArray] = []
     for c in b.columns
-        nodes_of(c, out)
+        nodes_of(c, var out)
     out
 
 // Every buffer in a batch, in the order the IPC metadata's `buffers`
@@ -658,7 +658,7 @@ fn has_dictionary(b: ArrowBatch, id: Int) -> Bool
 fn nodes_of(a: ArrowArray, var out: [ArrowArray])
     list.push(out, a)
     for c in a.children
-        nodes_of(c, out)
+        nodes_of(c, var out)
 
 fn paths_of(a: ArrowArray, here: Str, fields: [ArrowField], var out: [Str])
     list.push(out, here)

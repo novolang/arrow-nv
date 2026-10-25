@@ -1,6 +1,6 @@
 [package]
 name        = "arrow-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "The Apache Arrow columnar format as values: the schema with every logical type, the buffer layout per type, a record batch whose buffers are spans into one body the caller owns, and the IPC stream and file formats as a feed-and-drain reader and a writer into a caller's cursor.  Nothing is copied on the way in and nothing is performed."
 license     = "Apache-2.0"
 
@@ -23,7 +23,7 @@ category    = "encoding"
 tags        = ["arrow", "columnar", "record-batch", "ipc", "flatbuffers", "zero-copy", "dataframe", "sans-io"]
 repository  = "https://github.com/novolang/arrow-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.14.0"
+novo        = ">= 0.21.1"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

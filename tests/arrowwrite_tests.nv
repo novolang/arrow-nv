@@ -55,13 +55,13 @@ fn test_a_writer_records_where_each_message_went() [io]
 
     test.case("the file format opens with the magic and the stream format does not")
     var c = bytes.cursor_le(bytes.zeros(4096))
-    match arrowwrite.write_prologue(w, c)
+    match arrowwrite.write_prologue(w, var c)
         Ok(step) => test.assert(step.1 == 8)
         Err(_)   => test.assert(false)
 
     let sw = arrowwrite.writer(ArrowStreamFormat, one_column_schema())
     var c2 = bytes.cursor_le(bytes.zeros(4096))
-    match arrowwrite.write_prologue(sw, c2)
+    match arrowwrite.write_prologue(sw, var c2)
         Ok(step) => test.assert(step.1 == 0)
         Err(_)   => test.assert(false)
 
@@ -73,7 +73,7 @@ fn test_a_write_that_does_not_fit_writes_nothing() [io]
 
     test.case("a cursor with no room refuses rather than truncating")
     var tiny = bytes.cursor_le(bytes.zeros(4))
-    match arrowwrite.write_batch(w, b, body, tiny)
+    match arrowwrite.write_batch(w, b, body, var tiny)
         Ok(_)  => test.assert(false)
         Err(f) =>
             test.assert(arrowfault.is_corrupt(f) == false)
@@ -81,7 +81,7 @@ fn test_a_write_that_does_not_fit_writes_nothing() [io]
 
     test.case("and a cursor sized from message_bound does not")
     var ok = bytes.cursor_le(bytes.zeros(arrowwrite.message_bound(b)))
-    match arrowwrite.write_batch(w, b, body, ok)
+    match arrowwrite.write_batch(w, b, body, var ok)
         Ok(step) => test.assert(step.1 > 0)
         Err(_)   => test.assert(false)
 
@@ -89,43 +89,43 @@ fn test_a_write_that_does_not_fit_writes_nothing() [io]
 fn test_the_buffer_builders_produce_the_layouts_the_readers_expect() [io]
     test.case("a validity bitmap is one bit per flag, padded")
     var c = bytes.cursor_le(bytes.zeros(64))
-    match arrowwrite.write_validity([true, false, true, true], c)
+    match arrowwrite.write_validity([true, false, true, true], var c)
         Ok(n)  => test.assert(n == arrowbuf.bitmap_bytes(4))
         Err(_) => test.assert(false)
 
     test.case("a Bool values buffer is the same shape, which is why it is a separate call")
     var c2 = bytes.cursor_le(bytes.zeros(64))
-    match arrowwrite.write_bits([true, false, true, true], c2)
+    match arrowwrite.write_bits([true, false, true, true], var c2)
         Ok(n)  => test.assert(n == arrowbuf.bitmap_bytes(4))
         Err(_) => test.assert(false)
 
     test.case("an offsets buffer is length + 1 entries, the first zero")
     var c3 = bytes.cursor_le(bytes.zeros(64))
-    match arrowwrite.write_offsets32([2, 3, 0], c3)
+    match arrowwrite.write_offsets32([2, 3, 0], var c3)
         Ok(n)  => test.assert(n >= 16)
         Err(_) => test.assert(false)
 
     test.case("64-bit offsets are twice the width")
     var c4 = bytes.cursor_le(bytes.zeros(64))
-    match arrowwrite.write_offsets64([2, 3, 0], c4)
+    match arrowwrite.write_offsets64([2, 3, 0], var c4)
         Ok(n)  => test.assert(n >= 32)
         Err(_) => test.assert(false)
 
     test.case("a fixed-width values buffer is bits per element over eight")
     var c5 = bytes.cursor_le(bytes.zeros(64))
-    match arrowwrite.write_ints([1, 2, 3, 4], 32, c5)
+    match arrowwrite.write_ints([1, 2, 3, 4], 32, var c5)
         Ok(n)  => test.assert(n == 16)
         Err(_) => test.assert(false)
 
     test.case("and writing floats at 16 or 32 bits rounds, which the caller chose")
     var c6 = bytes.cursor_le(bytes.zeros(64))
-    match arrowwrite.write_floats([1.5, 2.5], 32, c6)
+    match arrowwrite.write_floats([1.5, 2.5], 32, var c6)
         Ok(n)  => test.assert(n == 8)
         Err(_) => test.assert(false)
 
     test.case("padding takes a running count and answers what it added")
     var c7 = bytes.cursor_le(bytes.zeros(64))
-    match arrowwrite.write_padding(9, c7)
+    match arrowwrite.write_padding(9, var c7)
         Ok(n)  => test.assert(n == 7)
         Err(_) => test.assert(false)
 
@@ -235,7 +235,7 @@ fn test_an_arrow_file_indexes_messages_and_not_columns() [io]
 
     test.case("what is answerable is the byte ranges inside one message's body")
     var c = bytes.cursor_le(bytes.zeros(arrowwrite.message_bound(one_column_batch())))
-    match arrowwrite.write_batch(arrowwrite.writer(ArrowStreamFormat, s), one_column_batch(), bytes.zeros(32), c)
+    match arrowwrite.write_batch(arrowwrite.writer(ArrowStreamFormat, s), one_column_batch(), bytes.zeros(32), var c)
         Err(_) => test.assert(false)
         Ok(_)  =>
             let written = c.finish()

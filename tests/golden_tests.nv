@@ -12,6 +12,7 @@ use arrowtype
 use arrowbuf
 use arrowcol
 use arrowwrite
+use arrowfault
 
 fn check_all_null(body: Bytes, a: ArrowArray)
     for k in 0..a.length
@@ -178,19 +179,19 @@ fn rewrite(src: Bytes, mode: ArrowIpcMode) -> Bytes
     let events = events_of(src, ArrowStreamFormat)
     var w = arrowwrite.writer(mode, schema_in(events))
     var c = bytes.cursor_le(bytes.zeros(4 * bytes.len(src) + 4096))
-    w = ok_writer(arrowwrite.write_prologue(w, c))
-    w = ok_writer(arrowwrite.write_schema(w, c))
+    w = ok_writer(arrowwrite.write_prologue(w, var c))
+    w = ok_writer(arrowwrite.write_schema(w, var c))
     for e in events
         match e
             ArrowDictionarySeen(id, values, delta, _, _) =>
-                w = ok_writer(arrowwrite.write_dictionary(w, ArrowDictEntry { id: id, values: values, body: src }, delta, c))
+                w = ok_writer(arrowwrite.write_dictionary(w, ArrowDictEntry { id: id, values: values, body: src }, delta, var c))
             ArrowBatchSeen(b, _, _)                      =>
                 var parts: [Bytes] = []
                 for buf in arrowcol.flatten_buffers(b)
                     list.push(parts, bytes.slice(src, buf.start, buf.start + buf.len))
-                w = ok_writer(arrowwrite.write_batch_parts(w, b, parts, c))
+                w = ok_writer(arrowwrite.write_batch_parts(w, b, parts, var c))
             _                                            => ()
-    w = ok_writer(arrowwrite.finish(w, c))
+    w = ok_writer(arrowwrite.finish(w, var c))
     bytes.slice(c.finish(), 0, w.written)
 
 fn ok_writer(r: Result<(ArrowWriter, Int), ArrowFault>) -> ArrowWriter

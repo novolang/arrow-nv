@@ -326,7 +326,7 @@ pub fn read_batch(src: Bytes, h: ArrowMessageHeader, s: ArrowSchema,
     var walk = BatchWalk { nodes: 0, buffers: 0 }
     var columns: [ArrowArray] = []
     for f in s.fields
-        list.push(columns, node(src, h, meta, head, f, f.name, walk)!)
+        list.push(columns, node(src, h, meta, head, f, f.name, var walk)!)
     counts(meta, head, walk, arrowtype.node_count_of(s), arrowtype.buffer_count_of_schema(s))!
     for f in s.fields
         if let Some(d) = f.dictionary
@@ -351,7 +351,7 @@ pub fn read_dictionary(src: Bytes, h: ArrowMessageHeader,
     let values_field = ArrowField { name: f.name, data_type: f.data_type, nullable: true, children: f.children,
                                     dictionary: None, type_ids: f.type_ids, metadata: [] }
     var walk = BatchWalk { nodes: 0, buffers: 0 }
-    let values = node(src, h, meta, data, values_field, f.name, walk)!
+    let values = node(src, h, meta, data, values_field, f.name, var walk)!
     let one = arrowtype.schema([values_field])
     counts(meta, data, walk, arrowtype.node_count_of(one), arrowtype.buffer_count_of_schema(one))!
     Ok((ArrowDictEntry { id: id, values: values, body: src }, delta))
@@ -468,7 +468,7 @@ pub fn ranges_for(src: Bytes, h: ArrowMessageHeader, s: ArrowSchema,
     for f in s.fields
         let wanted = list.contains(names, f.name)
         let first = walk.buffers
-        node(src, h, meta, head, f, f.name, walk)!
+        node(src, h, meta, head, f, f.name, var walk)!
         if wanted
             for k in first..walk.buffers
                 let b = buffer_at(meta, head, k)!
@@ -874,7 +874,7 @@ fn node(src: Bytes, h: ArrowMessageHeader, meta: Bytes, batch: ArrowFbPos, f: Ar
     var children: [ArrowArray] = []
     if f.dictionary == None
         for c in f.children
-            list.push(children, node(src, h, meta, batch, c, "${path}.${c.name}", walk)!)
+            list.push(children, node(src, h, meta, batch, c, "${path}.${c.name}", var walk)!)
     let id = match f.dictionary
         Some(d) => d.id
         None    => -1

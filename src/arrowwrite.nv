@@ -131,7 +131,7 @@ pub fn write_schema(w: ArrowWriter, var dst: Cursor) -> Result<(ArrowWriter, Int
         return Err(ArrowUnexpectedMessage("schema", "record batch", arrowfault.nowhere()))
     let meta = encoded(message_object(1, schema_object(w.schema), 0))
     room(dst, 8 + bytes.len(meta))!
-    put_prefix(dst, bytes.len(meta))
+    put_prefix(var dst, bytes.len(meta))
     dst.put_bytes(meta)
     let n = 8 + bytes.len(meta)
     let next = advanced(w, n)
@@ -161,7 +161,7 @@ pub fn write_dictionary(w: ArrowWriter, entry: ArrowDictEntry, is_delta: Bool,
     let batch = record_batch_object(entry.values.length, nodes, entry.body, layout)!
     let dict = ArrowFbTable([ArrowFbScalar(entry.id, 8), ArrowFbRef(batch), ArrowFbScalar((if is_delta then 1 else 0), 1)])
     let meta = encoded(message_object(2, dict, body_len(layout)))
-    let n = put_message(dst, meta, parts, layout)!
+    let n = put_message(var dst, meta, parts, layout)!
     let block = ArrowBlock { offset: w.written, metadata_len: 8 + bytes.len(meta), body_len: body_len(layout) }
     var sent = w.dictionaries_sent[:]
     list.push(sent, entry.id)
@@ -192,7 +192,7 @@ pub fn write_batch(w: ArrowWriter, b: ArrowBatch, body: Bytes,
         return Err(ArrowShortBody(reach, bytes.len(body), arrowfault.nowhere()))
     let whole = arrowbuf.padded_len(reach)
     let meta = batch_metadata(b, plain_offsets(b), [body], whole)!
-    let n = put_message(dst, meta, [bytes.slice(body, 0, reach)], [(0, whole)])!
+    let n = put_message(var dst, meta, [bytes.slice(body, 0, reach)], [(0, whole)])!
     Ok((recorded(w, 8 + bytes.len(meta), whole, n), n))
 
 // A record batch whose buffers are scattered across several of the
@@ -211,7 +211,7 @@ pub fn write_batch_parts(w: ArrowWriter, b: ArrowBatch, parts: [Bytes],
         return Err(ArrowBufferCountWrong(list.len(buffers), list.len(parts), arrowfault.nowhere()))
     let layout = packed(parts)
     let meta = batch_metadata(b, layout, parts, body_len(layout))!
-    let n = put_message(dst, meta, parts, layout)!
+    let n = put_message(var dst, meta, parts, layout)!
     Ok((recorded(w, 8 + bytes.len(meta), body_len(layout), n), n))
 
 // The end of a stream: the zero-length message.
@@ -222,12 +222,12 @@ pub fn write_batch_parts(w: ArrowWriter, b: ArrowBatch, parts: [Bytes],
 pub fn finish(w: ArrowWriter, var dst: Cursor) -> Result<(ArrowWriter, Int), ArrowFault>
     if w.mode == ArrowStreamFormat
         room(dst, 8)!
-        put_prefix(dst, 0)
+        put_prefix(var dst, 0)
         return Ok((advanced(w, 8), 8))
     let footer = encoded(footer_object(w.schema, w.dictionary_blocks, w.blocks))
     let n = 8 + bytes.len(footer) + 10
     room(dst, n)!
-    put_prefix(dst, 0)
+    put_prefix(var dst, 0)
     dst.put_bytes(footer)
     dst.put_u32(bytes.len(footer))
     dst.put_bytes(bytes.slice(arrowipc.file_magic(), 0, 6))
@@ -242,7 +242,7 @@ pub fn finish(w: ArrowWriter, var dst: Cursor) -> Result<(ArrowWriter, Int), Arr
 // specification and is required by every implementation that counts
 // nulls with a population count over whole words.
 pub fn write_validity(present: [Bool], var dst: Cursor) -> Result<Int, ArrowFault>
-    write_bitmap(present, dst)
+    write_bitmap(present, var dst)
 
 // A 32-bit offsets buffer for these element lengths.
 //
@@ -251,11 +251,11 @@ pub fn write_validity(present: [Bool], var dst: Cursor) -> Result<Int, ArrowFaul
 // hold, which is the moment a caller has to move to `LargeUtf8` and the
 // moment an implementation that wrapped would corrupt silently.
 pub fn write_offsets32(lengths: [Int], var dst: Cursor) -> Result<Int, ArrowFault>
-    write_offsets(lengths, 4, dst)
+    write_offsets(lengths, 4, var dst)
 
 // A 64-bit offsets buffer.
 pub fn write_offsets64(lengths: [Int], var dst: Cursor) -> Result<Int, ArrowFault>
-    write_offsets(lengths, 8, dst)
+    write_offsets(lengths, 8, var dst)
 
 // A fixed-width values buffer from integers, at `bits` per element.
 pub fn write_ints(values: [Int], bits: Int, var dst: Cursor) -> Result<Int, ArrowFault>
@@ -263,8 +263,8 @@ pub fn write_ints(values: [Int], bits: Int, var dst: Cursor) -> Result<Int, Arro
     let n = arrowbuf.padded_len(list.len(values) * width)
     room(dst, n)!
     for v in values
-        put_le(dst, v, width)
-    pad(dst, n - list.len(values) * width)
+        put_le(var dst, v, width)
+    pad(var dst, n - list.len(values) * width)
     Ok(n)
 
 // A fixed-width values buffer from floats, at `bits` per element.
@@ -284,13 +284,13 @@ pub fn write_floats(values: [Float], bits: Int, var dst: Cursor) -> Result<Int, 
                 narrow(v, 8, 23)
             else
                 float.to_bits(v)
-        put_le(dst, raw, width)
-    pad(dst, n - list.len(values) * width)
+        put_le(var dst, raw, width)
+    pad(var dst, n - list.len(values) * width)
     Ok(n)
 
 // A `Bool` values buffer — one bit per element.
 pub fn write_bits(values: [Bool], var dst: Cursor) -> Result<Int, ArrowFault>
-    write_bitmap(values, dst)
+    write_bitmap(values, var dst)
 
 // Zero bytes up to the next alignment boundary.
 //
@@ -300,7 +300,7 @@ pub fn write_bits(values: [Bool], var dst: Cursor) -> Result<Int, ArrowFault>
 pub fn write_padding(written: Int, var dst: Cursor) -> Result<Int, ArrowFault>
     let n = arrowbuf.padded_len(written) - written
     room(dst, n)!
-    pad(dst, n)
+    pad(var dst, n)
     Ok(n)
 
 // ── Writing a whole stream to a host ────────────────────────────────
@@ -330,8 +330,8 @@ pub fn write_all<S: Write[e]>(mode: ArrowIpcMode, s: ArrowSchema, batches: [Arro
         return Err(ArrowBufferCountWrong(list.len(batches), list.len(bodies), arrowfault.nowhere()))
     var c = bytes.cursor_le(bytes.zeros(size))
     var w = writer(mode, s)
-    w = write_prologue(w, c)!.0
-    w = write_schema(w, c)!.0
+    w = write_prologue(w, var c)!.0
+    w = write_schema(w, var c)!.0
     for k in 0..list.len(batches)
         var seen: [Int] = []
         for d in batches[k].dictionaries
@@ -339,8 +339,8 @@ pub fn write_all<S: Write[e]>(mode: ArrowIpcMode, s: ArrowSchema, batches: [Arro
             let here = count_of(seen, d.id)
             list.push(seen, d.id)
             if here >= sent_before
-                w = write_dictionary(w, d, here > 0, c)!.0
-        w = write_batch(w, batches[k], bodies[k], c)!.0
+                w = write_dictionary(w, d, here > 0, var c)!.0
+        w = write_batch(w, batches[k], bodies[k], var c)!.0
     w = finish(w, c)!.0
     let out = bytes.slice(c.finish(), 0, w.written)
     var done = 0
@@ -438,15 +438,15 @@ fn put_message(var dst: Cursor, meta: Bytes, parts: [Bytes],
     let body = body_len(layout)
     let n = 8 + bytes.len(meta) + body
     room(dst, n)!
-    put_prefix(dst, bytes.len(meta))
+    put_prefix(var dst, bytes.len(meta))
     dst.put_bytes(meta)
     var at = 0
     for k in 0..list.len(parts)
         let (start, _) = layout[k]
-        pad(dst, start - at)
+        pad(var dst, start - at)
         dst.put_bytes(parts[k])
         at = start + bytes.len(parts[k])
-    pad(dst, body - at)
+    pad(var dst, body - at)
     Ok(n)
 
 // The metadata of a record batch message whose buffers sit at `layout`
@@ -614,7 +614,7 @@ fn write_bitmap(flags: [Bool], var dst: Cursor) -> Result<Int, ArrowFault>
             dst.put_u8(acc)
             used = used + 1
             acc = 0
-    pad(dst, n - used)
+    pad(var dst, n - used)
     Ok(n)
 
 fn write_offsets(lengths: [Int], width: Int, var dst: Cursor) -> Result<Int, ArrowFault>
@@ -632,11 +632,11 @@ fn write_offsets(lengths: [Int], width: Int, var dst: Cursor) -> Result<Int, Arr
         total = total + lengths[i]
     room(dst, n)!
     var at = 0
-    put_le(dst, 0, width)
+    put_le(var dst, 0, width)
     for len in lengths
         at = at + len
-        put_le(dst, at, width)
-    pad(dst, n - (list.len(lengths) + 1) * width)
+        put_le(var dst, at, width)
+    pad(var dst, n - (list.len(lengths) + 1) * width)
     Ok(n)
 
 // `v` rounded to the nearest binary16 or binary32 value, ties to even,
