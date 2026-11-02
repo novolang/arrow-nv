@@ -379,10 +379,12 @@ fn test_the_writer_refuses_what_it_cannot_describe()
         Err(e) => test.fail(e.message())
     test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch(w, int_batch(), bytes.zeros(4), var c))),
         ArrowIncomplete)
-    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch_parts(w, int_batch(), [], var c))), ArrowCorrupt)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_batch_parts(w, int_batch(), [], var c))),
+        ArrowCorrupt)
     let bad = ArrowDictEntry { id: 1, values: arrowcol.array(ArrowInt8, 1, 0, [arrowbuf.no_buffer(), arrowbuf.buffer(8, 1)]),
                                body: bytes.zeros(2) }
-    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_dictionary(w, bad, false, var c))), ArrowIncomplete)
+    test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_dictionary(w, bad, false, var c))),
+        ArrowIncomplete)
     var full = bytes.cursor_le(bytes.zeros(2))
     test.assert_eq(arrowfault.kind_of(refused(arrowwrite.write_schema(w, var full))), ArrowUnsupported)
     test.assert_eq(arrowfault.kind_of(refused(arrowwrite.finish(w, var full))), ArrowUnsupported)
